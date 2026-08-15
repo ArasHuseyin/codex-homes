@@ -1,0 +1,43 @@
+{
+  "name": "codex-homes",
+  "version": "0.1.0",
+  "description": "Switch between multiple Codex / ChatGPT accounts using fully isolated CODEX_HOME profiles",
+  "keywords": [
+    "codex",
+    "openai",
+    "chatgpt",
+    "cli",
+    "account",
+    "profile",
+    "switch",
+    "multi-account",
+    "codex-home"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "codex-homes": "bin/codex-homes.js",
+    "cxh": "bin/codex-homes.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "codex-homes": "node bin/codex-homes.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/USER/codex-homes.git"
+  },
+  "bugs": {
+    "url": "https://github.com/USER/codex-homes/issues"
+  },
+  "homepage": "https://github.com/USER/codex-homes#readme"
+}
