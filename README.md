@@ -1,5 +1,9 @@
 # codex-homes
 
+[![tests](https://github.com/ArasHuseyin/codex-homes/actions/workflows/ci.yml/badge.svg)](https://github.com/ArasHuseyin/codex-homes/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/codex-homes)](https://www.npmjs.com/package/codex-homes)
+[![license](https://img.shields.io/npm/l/codex-homes)](./LICENSE)
+
 Switch between multiple Codex / ChatGPT accounts using **fully isolated `CODEX_HOME` profiles**.
 
 Built for the common case of a work machine that is logged into a company ChatGPT account

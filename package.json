@@ -34,10 +34,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/USER/codex-homes.git"
+    "url": "git+https://github.com/ArasHuseyin/codex-homes.git"
   },
   "bugs": {
-    "url": "https://github.com/USER/codex-homes/issues"
+    "url": "https://github.com/ArasHuseyin/codex-homes/issues"
   },
-  "homepage": "https://github.com/USER/codex-homes#readme"
+  "homepage": "https://github.com/ArasHuseyin/codex-homes#readme"
 }
