@@ -72,6 +72,17 @@ instead of describing it.
   entry no longer hides codex.
 - The running-Codex check matches `codex*.exe` rather than only `codex.exe` and
   falls back to inspecting node command lines.
+- A damaged `registry.json` made every command fail with an error telling the
+  user to run `doctor --fix` — including `doctor --fix`, which read the same
+  file. Doctor now reads the registry tolerantly, moves a damaged one aside as
+  `registry.json.corrupt` and re-registers the profile directories on disk.
+- `doctor --fix` restores the active profile from where the link points, so a
+  registry rebuilt from disk does not leave the setup in link mode with no
+  active profile. `doctor` no longer reports that the link "points at the
+  active profile" when there is no active profile at all.
+- The `init` next-step lines aligned their descriptions with padding written
+  into the string, which only fitted the default profile names — `--main` and
+  `--reserve` pushed the columns apart. The column is measured now.
 
 ## [0.1.0] - 2026-08-15
 

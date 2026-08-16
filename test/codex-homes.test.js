@@ -55,6 +55,22 @@ async function quiet(fn) {
   }
 }
 
+/** Run `fn` and return everything it wrote to stdout. */
+async function capture(fn) {
+  const write = process.stdout.write.bind(process.stdout);
+  let out = '';
+  process.stdout.write = (chunk) => {
+    out += chunk;
+    return true;
+  };
+  try {
+    await fn();
+  } finally {
+    process.stdout.write = write;
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ argv
 
 test('parseArgs handles flags, values and passthrough', () => {
@@ -572,6 +588,101 @@ test('init replaces the untouched placeholder an earlier --no-link run left behi
     assert.equal(code, 0);
     assert.equal(link.pointsTo(linkPath, home), true);
     assert.equal(fs.readFileSync(path.join(home, 'auth.json'), 'utf8'), '{"auth_mode":"chatgpt"}');
+  });
+});
+
+// ------------------------------------------------------------------ ui
+
+test('steps aligns descriptions on the widest command, not on fixed padding', async () => {
+  const { steps } = await import('../src/ui.js');
+
+  // The profile name sits inside the command, so --main/--reserve decide the
+  // width: padding written into the string cannot be right for both.
+  const text = await capture(() =>
+    steps([
+      ['codex-homes use privat', 'switch to the empty profile'],
+      ['codex login', 'log in with your second account'],
+      ['codex-homes use firma-account-lang', 'switch back'],
+    ]),
+  );
+
+  const lines = text.split('\n').filter(Boolean);
+  const columns = [
+    lines[0].indexOf('switch to the empty profile'),
+    lines[1].indexOf('log in with your second account'),
+    lines[2].indexOf('switch back'),
+  ];
+  assert.equal(new Set(columns).size, 1, `descriptions start at columns ${columns.join(', ')}`);
+});
+
+test('steps leaves an undescribed line out of the column measurement', async () => {
+  const { steps } = await import('../src/ui.js');
+  const long = 'codex-homes run privat -- "review this diff"';
+
+  const text = await capture(() =>
+    steps([
+      ['codex-homes login privat', 'log in'],
+      [long],
+      ['codex-homes shims --path', 'one command per account'],
+    ]),
+  );
+
+  const lines = text.split('\n').filter(Boolean);
+  assert.equal(lines[0].indexOf('log in'), lines[2].indexOf('one command per account'));
+  // Otherwise the one long example would push every description past its width.
+  assert.ok(lines[0].indexOf('log in') < long.length);
+});
+
+// ------------------------------------------------------------------ recovery
+
+test('doctor --fix repairs the corrupt registry its own error message points at', async () => {
+  await withSandbox(async () => {
+    const commands = await import('../src/commands.js');
+    const registry = await import('../src/registry.js');
+    const paths = await import('../src/paths.js');
+
+    const linkPath = paths.codexLink();
+    fs.mkdirSync(linkPath, { recursive: true });
+    fs.writeFileSync(path.join(linkPath, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    await quiet(() => commands.init({ _: [], yes: true }));
+
+    fs.writeFileSync(paths.registryPath(), 'not json at all');
+    // load() sends the user to doctor --fix, so doctor must get past this file.
+    assert.throws(() => registry.load(), /doctor --fix/);
+
+    const code = await quiet(() => commands.doctor({ _: [], fix: true }));
+    assert.equal(code, 0);
+
+    const reg = registry.load();
+    assert.deepEqual(
+      reg.profiles.map((p) => p.name).sort(),
+      ['codex-main', 'codex-reserve'],
+      'the profile directories on disk are registered again',
+    );
+    assert.ok(fs.existsSync(`${paths.registryPath()}.corrupt`), 'the damaged file is kept');
+  });
+});
+
+test('doctor --fix takes the active profile from where the link points', async () => {
+  await withSandbox(async () => {
+    const commands = await import('../src/commands.js');
+    const registry = await import('../src/registry.js');
+    const paths = await import('../src/paths.js');
+
+    const linkPath = paths.codexLink();
+    fs.mkdirSync(linkPath, { recursive: true });
+    fs.writeFileSync(path.join(linkPath, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    await quiet(() => commands.init({ _: [], yes: true }));
+
+    // A registry rebuilt from disk knows the profiles but not which is active.
+    const reg = registry.load();
+    reg.active = null;
+    registry.save(reg);
+
+    const code = await quiet(() => commands.doctor({ _: [], fix: true }));
+    assert.equal(code, 0);
+    assert.equal(registry.load().active, 'codex-main');
+    assert.equal(link.pointsTo(linkPath, paths.profileDir('codex-main')), true);
   });
 });
 

@@ -26,7 +26,7 @@ import {
   unshimmable,
   writeShims,
 } from './shims.js';
-import { bold, confirm, cyan, dim, fail, green, info, ok, table, warn, yellow } from './ui.js';
+import { bold, confirm, cyan, dim, fail, green, info, ok, steps, table, warn, yellow } from './ui.js';
 
 const DEFAULT_MAIN = 'codex-main';
 const DEFAULT_RESERVE = 'codex-reserve';
@@ -262,17 +262,21 @@ export async function init(args) {
     explainNoLinkMode();
     info('');
     info('Next steps:');
-    info(`  1. ${cyan(`codex-homes login ${mainName}`)}      log in with your first account`);
-    info(`  2. ${cyan(`codex-homes login ${reserveName}`)}   log in with your second account`);
-    info(`  3. ${cyan(`codex-homes run ${reserveName} -- "review this diff"`)}`);
-    info(`  4. ${cyan('codex-homes shims --path')}            one command per account`);
+    steps([
+      [cyan(`codex-homes login ${mainName}`), 'log in with your first account'],
+      [cyan(`codex-homes login ${reserveName}`), 'log in with your second account'],
+      [cyan(`codex-homes run ${reserveName} -- "review this diff"`)],
+      [cyan('codex-homes shims --path'), 'one command per account'],
+    ]);
   } else {
     ok(`active profile: ${bold(reg.active ?? mainName)}`);
     info('');
     info('Next steps:');
-    info(`  1. ${cyan(`codex-homes use ${reserveName}`)}   switch to the empty profile`);
-    info(`  2. ${cyan('codex login')}                        log in with your second account`);
-    info(`  3. ${cyan(`codex-homes use ${mainName}`)}      switch back`);
+    steps([
+      [cyan(`codex-homes use ${reserveName}`), 'switch to the empty profile'],
+      [cyan('codex login'), 'log in with your second account'],
+      [cyan(`codex-homes use ${mainName}`), 'switch back'],
+    ]);
   }
   info('');
   warnAboutEnvOverride();
@@ -539,11 +543,30 @@ export async function doctor(args) {
     fail(`no registry at ${registryPath()} — run "codex-homes init"`);
     return 1;
   }
-  const reg = registry.load();
+  const { registry: reg, corrupt: registryCorrupt } = registry.loadTolerant();
   const mode = linkMode(reg);
 
   info('');
   info(bold('Checks'));
+
+  // 0. registry readable — a plain load() throws here and points at this very
+  //    command, so doctor has to be able to get past a damaged file.
+  if (registryCorrupt) {
+    note(`${registryPath()} is not valid JSON`);
+    info(`  ${yellow('!!')} registry is not valid JSON`);
+    if (args.fix) {
+      try {
+        const backup = registry.quarantine();
+        registry.save(reg);
+        fixes.push(`moved the damaged registry to ${backup} and started a fresh one`);
+        resolveLast();
+      } catch (err) {
+        info(`  ${dim(`could not replace the registry: ${err.message}`)}`);
+      }
+    }
+  } else {
+    info(`  ${green('OK')} registry is readable`);
+  }
 
   // 1. CODEX_HOME override
   if (process.env.CODEX_HOME) {
@@ -556,6 +579,9 @@ export async function doctor(args) {
   // 2. link health — only a problem when this install is meant to have a link
   const state = link.inspect(linkPath);
   const activeHome = reg.active ? profileDir(reg.active) : null;
+  // Held so the repair further down can mark it resolved: the link records the
+  // answer, but the profiles it names are only registered after the orphan pass.
+  let noActiveProblem = null;
   if (mode === 'no-link') {
     info(`  ${dim('--')} no-link mode: ${linkPath} is not managed, profiles are selected per command`);
   } else if (!state.exists) {
@@ -575,7 +601,13 @@ export async function doctor(args) {
   } else if (!state.isLink) {
     note(`${linkPath} is a real directory, not a link — run "codex-homes init"`);
     info(`  ${yellow('!!')} ${linkPath} is a real directory (not managed by codex-homes)`);
-  } else if (activeHome && !link.pointsTo(linkPath, activeHome)) {
+  } else if (!activeHome) {
+    // Saying the link "points at the active profile" here would be a lie:
+    // there is no active profile to point at.
+    note(`${linkPath} is a link but no profile is marked active`);
+    noActiveProblem = problems[problems.length - 1];
+    info(`  ${yellow('!!')} link exists but no profile is marked active`);
+  } else if (!link.pointsTo(linkPath, activeHome)) {
     note(`${linkPath} does not point at the active profile "${reg.active}"`);
     info(`  ${yellow('!!')} link points at ${state.target}, expected ${activeHome}`);
     if (args.fix) {
@@ -627,6 +659,19 @@ export async function doctor(args) {
     }
   } else {
     info(`  ${green('OK')} no unregistered profile directories`);
+  }
+
+  // 3b. A registry rebuilt from disk has no active profile, but the link still
+  //     records which one it points at — without this the setup stays in link
+  //     mode while reporting that no profile is active.
+  if (args.fix && mode === 'link' && !reg.active && state.isLink) {
+    const target = reg.profiles.find((p) => link.pointsTo(linkPath, profileDir(p.name)));
+    if (target) {
+      reg.active = target.name;
+      registry.save(reg);
+      fixes.push(`active profile restored to "${target.name}" from where the link points`);
+      if (noActiveProblem) noActiveProblem.fixed = true;
+    }
   }
 
   // 4. codex binary

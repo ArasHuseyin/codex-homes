@@ -61,6 +61,26 @@ export function table(headers, rows) {
   for (const row of rows) info(line(row));
 }
 
+/**
+ * Render numbered next-step lines with their descriptions in one column.
+ *
+ * The column is measured, not hardcoded: profile names appear inside the
+ * commands, so `--main`/`--reserve` decide how wide it has to be. Items given
+ * without a description are printed as-is and left out of the measurement, so
+ * one long example line cannot push the column off the screen.
+ *
+ * @param {Array<[string, string?]>} items `[command, description]` pairs
+ */
+export function steps(items) {
+  const described = items.filter(([, description]) => description);
+  const column = described.length ? Math.max(...described.map(([command]) => width(command))) : 0;
+
+  items.forEach(([command, description], index) => {
+    const pad = ' '.repeat(Math.max(0, column - width(command)));
+    info(`  ${index + 1}. ${command}${description ? `${pad}   ${description}` : ''}`);
+  });
+}
+
 /** Yes/no prompt. Returns `fallback` when stdin is not a TTY. */
 export async function confirm(question, fallback = false) {
   if (!stdin.isTTY) return fallback;

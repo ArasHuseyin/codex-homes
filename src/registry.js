@@ -50,6 +50,36 @@ export function load() {
   return registry;
 }
 
+/**
+ * Load the registry without throwing when the file is damaged.
+ *
+ * `load()` sends the user to `doctor --fix`, so doctor is the one command that
+ * must get past a broken file — reading it with load() would make that advice a
+ * dead end. The empty registry handed back here turns every profile directory
+ * on disk into an orphan, which is exactly what doctor already knows how to
+ * re-register.
+ */
+export function loadTolerant() {
+  try {
+    return { registry: load(), corrupt: false };
+  } catch {
+    return { registry: emptyRegistry(), corrupt: true };
+  }
+}
+
+/**
+ * Move a damaged registry aside so a fresh one can take its place. Kept rather
+ * than deleted: it is the only record of the profile notes and of which profile
+ * was active.
+ */
+export function quarantine() {
+  const file = registryPath();
+  const backup = `${file}.corrupt`;
+  fs.rmSync(backup, { force: true });
+  fs.renameSync(file, backup);
+  return backup;
+}
+
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
