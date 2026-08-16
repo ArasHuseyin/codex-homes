@@ -4,7 +4,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { parseArgs } from '../src/cli.js';
+import { HANDLERS, parseArgs } from '../src/cli.js';
+import {
+  COMMANDS,
+  TOPICS,
+  findCommand,
+  findTopic,
+  helpTargets,
+  renderAll,
+  renderCommand,
+  renderOverview,
+  renderTopic,
+} from '../src/help.js';
 import * as link from '../src/link.js';
 import { readAccount } from '../src/auth.js';
 import { buildCmdPayload, buildNodeCodexProbe, quoteForCmd } from '../src/codex.js';
@@ -562,4 +573,98 @@ test('init replaces the untouched placeholder an earlier --no-link run left behi
     assert.equal(link.pointsTo(linkPath, home), true);
     assert.equal(fs.readFileSync(path.join(home, 'auth.json'), 'utf8'), '{"auth_mode":"chatgpt"}');
   });
+});
+
+// ------------------------------------------------------------------ help
+
+/** The same camelisation the argv parser applies to a long flag. */
+function camel(value) {
+  return value.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+test('the help documents every command the CLI dispatches, and nothing it does not', () => {
+  const documented = COMMANDS.flatMap((c) => [c.name, ...c.aliases]);
+  // "help" is answered before the dispatch table is consulted, so it is the one
+  // documented name that has no handler behind it.
+  const dispatched = [...Object.keys(HANDLERS), 'help'];
+  assert.deepEqual(documented.sort(), dispatched.sort());
+});
+
+test('every flag the help documents is one the parser actually understands', () => {
+  for (const spec of COMMANDS) {
+    for (const [flags, description] of spec.options) {
+      const forms = flags.split(',').map((f) => f.trim());
+      const long = forms.find((f) => f.startsWith('--'));
+      assert.ok(long, `${spec.name}: "${flags}" documents no long form`);
+      assert.ok(description, `${spec.name}: "${flags}" has no description`);
+
+      const name = long.replace(/\s+<.*$/, '');
+      const negated = name.startsWith('--no-');
+      const takesValue = /<[^>]+>/.test(long);
+      const key = camel(negated ? name.slice(5) : name.slice(2));
+
+      // A documented "--flag <value>" that is not a value flag would silently
+      // parse as true and swallow the value as a positional argument.
+      assert.equal(
+        parseArgs(takesValue ? [name, 'x'] : [name])[key],
+        takesValue ? 'x' : !negated,
+        `${spec.name}: ${long} does not parse into "${key}"`,
+      );
+
+      const short = forms.find((f) => /^-[^-]/.test(f));
+      if (short) {
+        assert.equal(
+          parseArgs([short])[key],
+          true,
+          `${spec.name}: ${short} is not an alias of ${name}`,
+        );
+      }
+    }
+  }
+});
+
+test('every name the help accepts renders a page', () => {
+  for (const target of helpTargets()) {
+    const spec = findCommand(target);
+    const topic = findTopic(target);
+    assert.ok(spec || topic, `no help page for "${target}"`);
+    const page = spec ? renderCommand(spec) : renderTopic(topic);
+    assert.ok(page.trim().length > 0, `empty help page for "${target}"`);
+  }
+});
+
+test('the overview shows the usage of every command and points at every guide', () => {
+  const overview = renderOverview('9.9.9');
+  assert.match(overview, /9\.9\.9/);
+  for (const spec of COMMANDS) {
+    assert.ok(overview.includes(spec.signature), `overview is missing "${spec.signature}"`);
+    assert.ok(overview.includes(spec.summary), `overview is missing the summary of "${spec.name}"`);
+  }
+  for (const topic of TOPICS) {
+    assert.ok(overview.includes(topic.name), `overview is missing the guide "${topic.name}"`);
+  }
+});
+
+test('help --all prints every command page and every guide', () => {
+  const all = renderAll('9.9.9');
+  for (const spec of COMMANDS) {
+    assert.ok(
+      all.includes(`codex-homes ${spec.usage ?? spec.signature}`),
+      `--all is missing the page for "${spec.name}"`,
+    );
+  }
+  for (const topic of TOPICS) {
+    assert.ok(all.includes(topic.title.toUpperCase()), `--all is missing the guide "${topic.name}"`);
+  }
+});
+
+test('a see-also always names something the help can show', () => {
+  for (const spec of COMMANDS) {
+    for (const name of spec.seeAlso) {
+      assert.ok(
+        findCommand(name) || findTopic(name),
+        `"${spec.name}" points at unknown help target "${name}"`,
+      );
+    }
+  }
 });
