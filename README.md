@@ -123,12 +123,29 @@ token. Give each parallel session its own profile.
 | `doctor [--fix]`               | Diagnose and repair the setup                               |
 | `restore [profile]`            | Undo everything: `~/.codex` becomes a real directory again  |
 | `path [profile]`               | Print a profile's `CODEX_HOME` directory                    |
+| `help [command\|topic]`        | Every command, one command in full, or a guide (`--all`)    |
 
 Profile names are yours to choose; `init` defaults to `codex-main` and `codex-reserve`
 (`--main` / `--reserve` override them). `codex`, `codex-homes` and `cxh` are the exception —
 a launcher by those names would shadow the command it calls. A profile registered under one
 of them by an older version keeps working, but gets no launcher; `doctor` says so and
 `doctor --fix` removes any that is already there.
+
+### Built-in help
+
+`codex-homes help` lists every command with its usage, the global flags and the
+environment variables. `codex-homes help <command>` — or `codex-homes <command> --help` —
+shows one command in full: its options, what it actually does, examples and related
+commands.
+
+```sh
+codex-homes help run              # everything "run" can do
+codex-homes help parallel         # a guide rather than a command
+codex-homes help --all            # the whole manual in one go
+```
+
+The three guides are `getting-started`, `parallel` (two accounts in two terminals at
+once) and `no-link` (machines that refuse the link).
 
 ### Shims
 

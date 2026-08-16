@@ -1,6 +1,16 @@
 import { createRequire } from 'node:module';
 import * as commands from './commands.js';
-import { bold, cyan, dim, fail, info } from './ui.js';
+import {
+  COMMANDS,
+  TOPICS,
+  findCommand,
+  findTopic,
+  renderAll,
+  renderCommand,
+  renderOverview,
+  renderTopic,
+} from './help.js';
+import { cyan, dim, fail, info } from './ui.js';
 
 const require = createRequire(import.meta.url);
 
@@ -72,63 +82,45 @@ function version() {
   }
 }
 
-function help() {
-  info(`
-${bold('codex-homes')} ${dim(`v${version()}`)} — switch between Codex accounts with isolated CODEX_HOME profiles
+/**
+ * `codex-homes help [command|topic]`, and what every command's `--help` shows.
+ * The pages themselves live in help.js, generated from one command reference so
+ * they cannot drift from the flags the handlers read.
+ */
+function help(args = { _: [] }) {
+  if (args.all) {
+    info(renderAll(version()));
+    return 0;
+  }
 
-${bold('USAGE')}
-  codex-homes <command> [options]        ${dim('(short alias: cxh)')}
+  const target = args._[0];
+  if (!target) {
+    info(renderOverview(version()));
+    return 0;
+  }
 
-${bold('SETUP')}
-  init                     Migrate ~/.codex into a profile and set up the link
-    --main <name>            name for the migrated profile   ${dim('(default: codex-main)')}
-    --reserve <name>         name for the second profile      ${dim('(default: codex-reserve)')}
-    --no-link                leave ~/.codex alone; select profiles per command
-    --no-copy-config         do not copy config.toml to the new profile
-    -y, --yes                skip confirmation
+  const command = findCommand(target);
+  if (command) {
+    info(renderCommand(command));
+    return 0;
+  }
 
-${bold('EVERYDAY')}
-  list                     Show all profiles and their accounts   ${dim('(--json)')}
-  use <profile>            Make a profile active for every shell
-  run <profile> [args...]  Run codex once under a profile, without switching
-  status                   Show the active profile and link health
-  path [profile]           Print a profile's CODEX_HOME directory
+  const topic = findTopic(target);
+  if (topic) {
+    info(renderTopic(topic));
+    return 0;
+  }
 
-${bold('ACCOUNTS')}
-  login <profile>          Run "codex login" inside a profile
-  logout <profile>         Run "codex logout" inside a profile
-
-${bold('MANAGE')}
-  add <profile>            Create a new empty profile   ${dim('(--from <profile>, --note <text>)')}
-  remove <profile>         Unregister a profile         ${dim('(--purge to delete its files)')}
-  config-sync <from> [to]  Copy config.toml between profiles   ${dim('(--force)')}
-  shims [--path]           Generate per-profile launchers, optionally add to PATH
-  doctor [--fix]           Diagnose and repair the setup
-  restore [profile]        Undo the setup: turn ~/.codex back into a real directory
-
-${bold('EXAMPLES')}
-  ${cyan('codex-homes init')}
-  ${cyan('codex-homes login codex-reserve')}
-  ${cyan('codex-homes use codex-reserve')}      ${dim('# every shell now uses the reserve account')}
-  ${cyan('codex-homes run codex-main -- "fix the failing test"')}
-  ${cyan('codex-homes list')}
-
-${bold('NOTES')}
-  Profiles live in ~/.codex-homes/profiles/<name> and each one is a full
-  CODEX_HOME: its own login, config.toml, sessions, history and MCP setup.
-  ~/.codex becomes a junction (Windows) or symlink (POSIX) to the active one.
-  Where that is not possible — a home directory on a network share, a locked
-  down work machine — "init --no-link" leaves ~/.codex alone and you pick the
-  profile per command instead.
-
-  "run" and the generated shims set CODEX_HOME for a single process, so any
-  number of Codex sessions can run side by side, each on its own account.
-  A CODEX_HOME variable set in your shell overrides all of this.
-`);
-  return 0;
+  fail(`no help for "${target}"`);
+  info('');
+  info(`${dim('commands')}  ${COMMANDS.map((c) => c.name).join(', ')}`);
+  info(`${dim('guides')}    ${TOPICS.map((t) => t.name).join(', ')}`);
+  info('');
+  info(`run ${cyan('codex-homes help')} for the overview`);
+  return 1;
 }
 
-const HANDLERS = {
+export const HANDLERS = {
   init: commands.init,
   list: commands.list,
   ls: commands.list,
@@ -155,7 +147,9 @@ const PASSTHROUGH = new Set(['run']);
 export async function run(argv) {
   const command = argv[0];
 
-  if (!command || command === 'help' || command === '--help' || command === '-h') return help();
+  if (!command || command === 'help' || command === '--help' || command === '-h') {
+    return help(parseArgs(argv.slice(1)));
+  }
   if (command === '--version' || command === '-v' || command === 'version') {
     info(version());
     return 0;
@@ -172,13 +166,15 @@ export async function run(argv) {
   if (PASSTHROUGH.has(command)) {
     const rest = argv.slice(1);
     const separator = rest.indexOf('--');
-    args =
-      separator === -1
-        ? { _: rest }
-        : { _: [...rest.slice(0, separator), ...rest.slice(separator + 1)] };
+    const own = separator === -1 ? rest : rest.slice(0, separator);
+    // Only a --help standing where the profile name belongs is a question about
+    // "run" itself. Once a profile is named, or after the separator, it is one
+    // of the arguments the command exists to hand to codex.
+    if (own[0] === '--help' || own[0] === '-h') return help({ _: [command] });
+    args = separator === -1 ? { _: rest } : { _: [...own, ...rest.slice(separator + 1)] };
   } else {
     args = parseArgs(argv.slice(1));
-    if (args.help) return help();
+    if (args.help) return help({ _: [command] });
   }
 
   return handler(args);
