@@ -48,6 +48,9 @@ npm install -g codex-homes
 
 Requires Node.js 18.17+ and the [Codex CLI](https://www.npmjs.com/package/@openai/codex) on your PATH.
 
+This installs two commands for the same program: `codex-homes` and the shorter `cxh`.
+The examples below use the long name; `cxh list` and `cxh use codex-main` work just as well.
+
 ## Quick start
 
 ```sh
@@ -112,11 +115,11 @@ token. Give each parallel session its own profile.
 | `init`                         | Migrate `~/.codex` into a profile and create the link       |
 | `init --no-link`               | Set profiles up without touching `~/.codex`                 |
 | `list` (`ls`)                  | Show profiles, accounts and plans (`--json` for scripting)  |
-| `use <profile>`                | Make a profile active everywhere                            |
+| `use <profile>` (`switch`)     | Make a profile active everywhere                            |
 | `run <profile> [args...]`      | Run codex once under a profile, without switching           |
 | `login` / `logout <profile>`   | Run `codex login` / `codex logout` inside a profile         |
-| `add <profile>`                | Create a profile (`--from <profile>` copies `config.toml`)  |
-| `remove <profile>`             | Unregister a profile (`--purge` also deletes its files)     |
+| `add <profile>` (`new`)        | Create a profile (`--from <profile>` copies `config.toml`)  |
+| `remove <profile>` (`rm`)      | Unregister a profile (`--purge` also deletes its files)     |
 | `config-sync <from> [to...]`   | Copy `config.toml` between profiles                         |
 | `shims [--path]`               | Generate `codex-main` / `codex-reserve` launchers           |
 | `status`                       | Active profile, link health, codex version                  |
