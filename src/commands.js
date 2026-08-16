@@ -21,7 +21,9 @@ import {
   removeShim,
   shimBody,
   shimDirOnPath,
+  shimExists,
   shimFileName,
+  unshimmable,
   writeShims,
 } from './shims.js';
 import { bold, confirm, cyan, dim, fail, green, info, ok, table, warn, yellow } from './ui.js';
@@ -77,6 +79,33 @@ function shimIsCurrent(name) {
   }
 }
 
+/**
+ * True when `dir` is a placeholder an earlier `--no-link` run created, rather
+ * than a profile holding something of the user's.
+ *
+ * That run copies `~/.codex/config.toml` in and nothing else, and the migration
+ * about to happen brings the very same bytes along — so removing a byte-identical
+ * copy loses nothing. A config.toml the user has since edited is their data and
+ * is worth more than the convenience of reusing the name, "only file present" or
+ * not: comparing the contents is what separates the two.
+ */
+function isInitPlaceholder(dir, migratedConfig) {
+  let contents;
+  try {
+    contents = fs.readdirSync(dir);
+  } catch {
+    return false;
+  }
+  if (contents.length === 0) return true;
+  if (contents.length !== 1 || contents[0] !== 'config.toml') return false;
+  try {
+    return fs.readFileSync(path.join(dir, 'config.toml')).equals(fs.readFileSync(migratedConfig));
+  } catch {
+    // No config.toml coming in to compare against, so this one is not a copy of it.
+    return false;
+  }
+}
+
 function explainNoLinkMode() {
   info('');
   info(`${dim('no-link mode:')} ${codexLink()} is not managed, so plain "codex" keeps using it.`);
@@ -108,6 +137,19 @@ export async function init(args) {
   const mainTarget = profileDir(mainName);
   const reserveTarget = profileDir(reserveName);
 
+  // Decided before the plan is printed, so the removal is something the user is
+  // shown and agrees to, and a refusal arrives before the prompts, not after them.
+  let replacePlaceholder = false;
+  if (willMigrate && fs.existsSync(mainTarget)) {
+    replacePlaceholder = isInitPlaceholder(mainTarget, path.join(linkPath, 'config.toml'));
+    if (!replacePlaceholder) {
+      throw new Error(
+        `profile "${mainName}" already holds data at ${mainTarget} — ` +
+          `pass --main <name> to migrate ${linkPath} into a different profile`,
+      );
+    }
+  }
+
   info('');
   info(bold('Plan'));
   info(`  profiles root   ${cyan(profilesDir())}`);
@@ -115,6 +157,9 @@ export async function init(args) {
     info(`  keep as is      ${linkPath} ${dim('(stays your unmanaged default account)')}`);
     info(`  create          ${mainTarget} ${dim('(empty)')}`);
   } else if (willMigrate) {
+    if (replacePlaceholder) {
+      info(`  replace         ${mainTarget} ${dim('(placeholder from an earlier --no-link run)')}`);
+    }
     info(`  migrate         ${linkPath}  ->  ${mainTarget}`);
     info(`  then link       ${linkPath}  ->  ${mainTarget}`);
   } else if (!state.exists) {
@@ -139,20 +184,8 @@ export async function init(args) {
 
   registry.ensureDirs();
 
-  if (willMigrate && fs.existsSync(mainTarget)) {
-    // A placeholder left by an earlier --no-link run holds nothing but the
-    // copied config.toml, and the migration brings that file along anyway.
-    // Anything else may be a real account and must never be overwritten.
-    const contents = fs.readdirSync(mainTarget);
-    if (contents.every((entry) => entry === 'config.toml')) {
-      fs.rmSync(mainTarget, { recursive: true, force: true });
-    } else {
-      throw new Error(
-        `profile "${mainName}" already holds data at ${mainTarget} — ` +
-          `pass --main <name> to migrate ${linkPath} into a different profile`,
-      );
-    }
-  }
+  // migrateDirToProfile renames onto this path, so the placeholder has to go first.
+  if (replacePlaceholder) fs.rmSync(mainTarget, { recursive: true, force: true });
 
   let mainCreated = false;
 
@@ -529,9 +562,15 @@ export async function doctor(args) {
     note(`${linkPath} does not exist`);
     info(`  ${yellow('!!')} ${linkPath} is missing`);
     if (args.fix && activeHome && fs.existsSync(activeHome)) {
-      link.setLink(linkPath, activeHome);
-      fixes.push(`recreated link -> ${activeHome}`);
-      resolveLast();
+      // A machine that refuses reparse points is the reason the link is missing
+      // as often as not, so report that instead of aborting the whole checkup.
+      try {
+        link.setLink(linkPath, activeHome);
+        fixes.push(`recreated link -> ${activeHome}`);
+        resolveLast();
+      } catch (err) {
+        info(`  ${yellow('!!')} could not recreate the link: ${err.message}`);
+      }
     }
   } else if (!state.isLink) {
     note(`${linkPath} is a real directory, not a link — run "codex-homes init"`);
@@ -540,9 +579,13 @@ export async function doctor(args) {
     note(`${linkPath} does not point at the active profile "${reg.active}"`);
     info(`  ${yellow('!!')} link points at ${state.target}, expected ${activeHome}`);
     if (args.fix) {
-      link.setLink(linkPath, activeHome);
-      fixes.push(`repointed link -> ${activeHome}`);
-      resolveLast();
+      try {
+        link.setLink(linkPath, activeHome);
+        fixes.push(`repointed link -> ${activeHome}`);
+        resolveLast();
+      } catch (err) {
+        info(`  ${yellow('!!')} could not repoint the link: ${err.message}`);
+      }
     }
   } else {
     info(`  ${green('OK')} ${linkPath} points at the active profile`);
@@ -595,17 +638,32 @@ export async function doctor(args) {
   }
 
   // 5. shims — stale launchers are how "run under the other account" goes wrong
-  const staleShims = reg.profiles.filter((p) => !shimIsCurrent(p.name)).map((p) => p.name);
+  const allNames = reg.profiles.map((p) => p.name);
+  const reservedNames = unshimmable(allNames);
+  const staleShims = allNames.filter((name) => !reservedNames.includes(name) && !shimIsCurrent(name));
   if (staleShims.length) {
     note(`launcher missing or outdated for: ${staleShims.join(', ')}`);
     info(`  ${yellow('!!')} launcher missing or outdated: ${staleShims.join(', ')}`);
     if (args.fix) {
-      writeShims(reg.profiles.map((p) => p.name));
+      writeShims(allNames);
       fixes.push(`rewrote ${staleShims.length} launcher(s)`);
       resolveLast();
     }
   } else {
     info(`  ${green('OK')} every profile has an up-to-date launcher`);
+  }
+
+  // Names that predate the reserved-name check. Renaming is the user's call, so
+  // this stays unresolved, but the self-calling launcher itself is removable.
+  if (reservedNames.length) {
+    note(`launcher would shadow the command it calls, so these profiles get none: ${reservedNames.join(', ')}`);
+    info(`  ${yellow('!!')} no launcher for: ${reservedNames.join(', ')} ${dim('(the name shadows the command it runs)')}`);
+    info(`     ${dim(`rename with "codex-homes add <new-name> --from <old>", then "codex-homes remove <old>"`)}`);
+    const looping = reservedNames.filter((name) => shimExists(name));
+    if (args.fix && looping.length) {
+      for (const name of looping) removeShim(name);
+      fixes.push(`removed ${looping.length} self-calling launcher(s): ${looping.join(', ')}`);
+    }
   }
 
   if (shimDirOnPath()) {
@@ -669,10 +727,21 @@ export async function configSync(args) {
 
 export function shims(args) {
   const reg = requireInitialised();
-  const written = writeShims(reg.profiles.map((p) => p.name));
+  const names = reg.profiles.map((p) => p.name);
+  const written = writeShims(names);
 
   ok(`wrote ${written.length} launcher(s) into ${shimDir()}`);
   for (const file of written) info(`   ${dim(path.basename(file))}`);
+
+  const skipped = unshimmable(names);
+  if (skipped.length) {
+    info('');
+    warn(
+      `no launcher for ${skipped.join(', ')} — a launcher of that name would shadow the\n` +
+        `   command it calls, and this directory goes on the front of your PATH.\n` +
+        `   Rename with "codex-homes add <new-name> --from <old>", then "codex-homes remove <old>".`,
+    );
+  }
 
   if (args.path) {
     const result = addShimDirToUserPath();
@@ -686,7 +755,8 @@ export function shims(args) {
   }
 
   info('');
-  info(`Then: ${cyan(`${reg.profiles[0]?.name ?? 'codex-main'} "explain this repo"`)}`);
+  const example = names.find((name) => !skipped.includes(name)) ?? 'codex-main';
+  info(`Then: ${cyan(`${example} "explain this repo"`)}`);
   info(dim('Each launcher sets CODEX_HOME for its own process, so one terminal per'));
   info(dim('account can run at the same time without them seeing each other.'));
   return 0;

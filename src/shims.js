@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { normalizeDirKey, profileDir, shimDir, splitPathEntries } from './paths.js';
+import { isReservedName, normalizeDirKey, profileDir, shimDir, splitPathEntries } from './paths.js';
 import { runPowerShell } from './win.js';
 
 const isWindows = process.platform === 'win32';
@@ -48,10 +48,26 @@ export function shimBody(homeDir, platform = process.platform) {
   ].join('\n');
 }
 
+/** The registered names that cannot be given a launcher, in registry order. */
+export function unshimmable(names) {
+  return names.filter((name) => isReservedName(name));
+}
+
+/** True when a launcher for `name` exists on disk. */
+export function shimExists(name) {
+  return fs.existsSync(path.join(shimDir(), shimFileName(name)));
+}
+
 /**
  * Write one launcher per profile so `codex-reserve <args>` runs Codex under that
  * profile without changing the active one. Because each launcher pins
  * CODEX_HOME for its own process only, several of them can run at the same time.
+ *
+ * Reserved names are skipped *and* actively cleaned up: a profile called `codex`
+ * registered before that name was rejected already has a launcher on disk whose
+ * `codex` call resolves straight back to itself once the shim directory is on
+ * PATH. Removing it here means every path that regenerates shims — init, add,
+ * shims, doctor --fix — heals that loop rather than recreating it.
  * @returns {string[]} the shim files written
  */
 export function writeShims(names) {
@@ -60,6 +76,10 @@ export function writeShims(names) {
   const written = [];
 
   for (const name of names) {
+    if (isReservedName(name)) {
+      removeShim(name);
+      continue;
+    }
     const file = path.join(dir, shimFileName(name));
     fs.writeFileSync(file, shimBody(profileDir(name)), 'utf8');
     if (!isWindows) fs.chmodSync(file, 0o755);

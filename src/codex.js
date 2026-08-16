@@ -106,15 +106,35 @@ export function runCodex(args, homeDir, extraEnv = {}) {
   });
 }
 
-// Matches any node process whose command line mentions codex. Used only to warn
-// before a switch, so a false negative costs a warning, never data.
-const NODE_CODEX_PROBE = `
+/**
+ * Matches any node process whose command line mentions codex — the npm build of
+ * Codex runs as `node .../codex/bin/codex.js`, so the image name gives nothing away.
+ *
+ * codex-homes is itself such a process ("codex-homes" contains "codex"), and so is
+ * the npx/npm wrapper that may have launched it, so the walk up the parent chain is
+ * what keeps the probe from always reporting yes and turning every `use` into a
+ * refused switch. The PID has to be substituted in rather than read from `$PID`,
+ * which inside the script is PowerShell's own process, not ours.
+ *
+ * Used only to warn before a switch, so a false negative costs a warning, never data.
+ */
+export function buildNodeCodexProbe(selfPid) {
+  return `
 $ErrorActionPreference = 'SilentlyContinue'
+$mine = @{}
+$id = ${Number(selfPid)}
+for ($i = 0; $i -lt 16 -and $id -gt 0 -and -not $mine.ContainsKey($id); $i++) {
+  $mine[$id] = $true
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$id"
+  if ($null -eq $p) { break }
+  $id = [int]$p.ParentProcessId
+}
 $hit = Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-  Where-Object { $_.CommandLine -like '*codex*' } |
+  Where-Object { -not $mine.ContainsKey([int]$_.ProcessId) -and $_.CommandLine -like '*codex*' } |
   Select-Object -First 1
 if ($hit) { Write-Output 'yes' } else { Write-Output 'no' }
 `.trim();
+}
 
 function windowsCodexRunning() {
   let listing;
@@ -135,7 +155,7 @@ function windowsCodexRunning() {
   // Skipped unless a node process exists at all, so the usual case stays cheap.
   if (!/^"node\.exe"/im.test(listing)) return false;
   try {
-    return runPowerShell(NODE_CODEX_PROBE, 8000) === 'yes';
+    return runPowerShell(buildNodeCodexProbe(process.pid), 8000) === 'yes';
   } catch {
     return false;
   }

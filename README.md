@@ -125,7 +125,10 @@ token. Give each parallel session its own profile.
 | `path [profile]`               | Print a profile's `CODEX_HOME` directory                    |
 
 Profile names are yours to choose; `init` defaults to `codex-main` and `codex-reserve`
-(`--main` / `--reserve` override them).
+(`--main` / `--reserve` override them). `codex`, `codex-homes` and `cxh` are the exception —
+a launcher by those names would shadow the command it calls. A profile registered under one
+of them by an older version keeps working, but gets no launcher; `doctor` says so and
+`doctor --fix` removes any that is already there.
 
 ### Shims
 

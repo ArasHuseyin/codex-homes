@@ -84,6 +84,19 @@ const WINDOWS_DEVICE_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
 const RESERVED_NAMES = ['codex', 'codex-homes', 'cxh'];
 
 /**
+ * True for a name whose launcher would shadow the command it calls.
+ *
+ * Separate from assertCreatableName because the shim generator has to ask the
+ * same question about profiles that already exist: versions before this check
+ * happily registered a profile called `codex`, and `shims --path` tells POSIX
+ * users to *prepend* the shim directory to PATH, which turns that launcher's
+ * `exec codex "$@"` into an infinite loop.
+ */
+export function isReservedName(name) {
+  return typeof name === 'string' && RESERVED_NAMES.includes(name.toLowerCase());
+}
+
+/**
  * Profile names end up as directory names, so reject anything that could escape
  * the profiles directory or collide with the shim generator.
  */
@@ -114,7 +127,7 @@ export function assertCreatableName(name) {
   }
   // Compared case-insensitively on every platform, so a profile created on a
   // Mac or Linux box stays usable when the same name reaches Windows.
-  if (RESERVED_NAMES.includes(name.toLowerCase())) {
+  if (isReservedName(name)) {
     throw new Error(
       `invalid profile name "${name}" — its launcher would shadow the "${name.toLowerCase()}" command on your PATH`,
     );

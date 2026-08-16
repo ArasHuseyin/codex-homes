@@ -94,6 +94,15 @@ export function removeLink(linkPath) {
 }
 
 /**
+ * Where setLink builds a replacement link before swapping it into place.
+ * Beside the link so the rename stays within one filesystem, and stamped with
+ * the pid so two switches running at once cannot collide.
+ */
+export function stagingPath(linkPath) {
+  return `${linkPath}.codex-homes-${process.pid}`;
+}
+
+/**
  * Point `linkPath` at `targetPath`, replacing an existing link.
  * Uses a Windows directory junction, which needs no elevated privileges
  * (unlike a true symlink, which requires admin or Developer Mode).
@@ -110,11 +119,61 @@ export function setLink(linkPath, targetPath) {
         `  and the generated shims to select a profile per command without a link.`,
     );
   }
-  if (state.exists) removeLink(linkPath);
+
+  const kind = isWindows ? 'junction' : 'dir';
+
+  if (!state.exists) {
+    try {
+      fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+      fs.symlinkSync(targetPath, linkPath, kind);
+    } catch (err) {
+      // An unusable parent is as much "this location will not hold a link" as a
+      // refused reparse point, and the fallback out of it is the same one.
+      throw linkFailure(linkPath, targetPath, err);
+    }
+    return;
+  }
+
+  // Build the replacement beside the old link before taking the old one down.
+  // A machine that refuses reparse points refuses them here, where the existing
+  // link is still standing — deleting first would answer "can I have a link?"
+  // by leaving the user with no Codex home at all, and that is exactly the
+  // locked-down setup where "use" and "doctor --fix" are most likely to fail.
+  const staging = stagingPath(linkPath);
   try {
-    fs.mkdirSync(path.dirname(linkPath), { recursive: true });
-    fs.symlinkSync(targetPath, linkPath, isWindows ? 'junction' : 'dir');
+    if (inspect(staging).isLink) removeLink(staging);
+  } catch {
+    /* leftover from a crashed run we cannot clear; the create below will say so */
+  }
+  try {
+    fs.symlinkSync(targetPath, staging, kind);
   } catch (err) {
+    throw linkFailure(linkPath, targetPath, err);
+  }
+
+  try {
+    removeLink(linkPath);
+  } catch (err) {
+    try {
+      removeLink(staging);
+    } catch {
+      /* best effort — the original failure is the one worth reporting */
+    }
+    throw err;
+  }
+
+  try {
+    fs.renameSync(staging, linkPath);
+  } catch (err) {
+    // The staged link proved this filesystem accepts one, so put it straight
+    // back rather than leaving the gap the rename was supposed to close.
+    try {
+      fs.symlinkSync(targetPath, linkPath, kind);
+      removeLink(staging);
+      return;
+    } catch {
+      /* fall through */
+    }
     throw linkFailure(linkPath, targetPath, err);
   }
 }

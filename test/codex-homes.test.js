@@ -7,8 +7,8 @@ import path from 'node:path';
 import { parseArgs } from '../src/cli.js';
 import * as link from '../src/link.js';
 import { readAccount } from '../src/auth.js';
-import { buildCmdPayload, quoteForCmd } from '../src/codex.js';
-import { assertCreatableName, caseInsensitiveFs, sameFsName, splitPathEntries } from '../src/paths.js';
+import { buildCmdPayload, buildNodeCodexProbe, quoteForCmd } from '../src/codex.js';
+import { assertCreatableName, caseInsensitiveFs, isReservedName, sameFsName, splitPathEntries } from '../src/paths.js';
 import { buildUserPathScript, shimBody, shimFileName } from '../src/shims.js';
 
 function tempDir(label) {
@@ -30,6 +30,17 @@ async function withSandbox(fn) {
     if (previousLink === undefined) delete process.env.CODEX_HOMES_LINK;
     else process.env.CODEX_HOMES_LINK = previousLink;
     fs.rmSync(base, { recursive: true, force: true });
+  }
+}
+
+/** Run `fn` with stdout swallowed, so a command's own output stays out of the report. */
+async function quiet(fn) {
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  try {
+    return await fn();
+  } finally {
+    process.stdout.write = write;
   }
 }
 
@@ -415,5 +426,140 @@ test('registry.save leaves no scratch file behind', async () => {
       registry.load().profiles.map((p) => p.name),
       ['work'],
     );
+  });
+});
+
+// ------------------------------------------------------------------ running-process probe
+
+test('the node probe never counts codex-homes itself as a running session', () => {
+  const script = buildNodeCodexProbe(4321);
+
+  // "codex-homes" contains "codex", so without an exclusion the tool matches its
+  // own node process, every "use" warns, and a non-TTY run aborts on the fallback.
+  assert.match(script, /\$id = 4321/);
+  assert.match(script, /-not \$mine\.ContainsKey\(\[int\]\$_\.ProcessId\)/);
+  // The npx/npm wrapper that launched us is a node process mentioning codex too.
+  assert.match(script, /ParentProcessId/);
+  // $PID inside the script is PowerShell's own process, not the one to skip.
+  assert.ok(!script.includes('$PID'), 'the pid must be substituted, not read from $PID');
+});
+
+test('the node probe coerces the pid instead of splicing it in', () => {
+  assert.ok(!buildNodeCodexProbe('123; Write-Output hacked').includes('hacked'));
+});
+
+// ------------------------------------------------------------------ reserved names
+
+test('a launcher is never written for a name that would shadow the command it calls', async () => {
+  await withSandbox(async () => {
+    const shims = await import('../src/shims.js');
+    const paths = await import('../src/paths.js');
+
+    assert.equal(isReservedName('codex'), true);
+    assert.equal(isReservedName('CODEX'), true);
+    assert.equal(isReservedName('work'), false);
+
+    // Versions before the reserved-name check registered "codex" happily, so the
+    // self-calling launcher is already on disk — regenerating must clear it, not
+    // recreate it. With the shim directory prepended to PATH it loops forever.
+    const dir = paths.shimDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const stale = path.join(dir, shims.shimFileName('codex'));
+    fs.writeFileSync(stale, shims.shimBody(paths.profileDir('codex')));
+
+    const written = shims.writeShims(['codex', 'work']);
+
+    assert.deepEqual(
+      written.map((f) => path.basename(f)),
+      [shims.shimFileName('work')],
+    );
+    assert.equal(fs.existsSync(stale), false, 'the self-calling launcher must be removed');
+    assert.deepEqual(shims.unshimmable(['codex', 'work', 'cxh']), ['codex', 'cxh']);
+  });
+});
+
+// ------------------------------------------------------------------ setLink safety
+
+test('setLink keeps the existing link when the replacement cannot be created', () => {
+  const base = tempDir('link-staging');
+  try {
+    const targetA = path.join(base, 'a');
+    const targetB = path.join(base, 'b');
+    const linkPath = path.join(base, 'active');
+    fs.mkdirSync(targetA);
+    fs.mkdirSync(targetB);
+    fs.writeFileSync(path.join(targetA, 'marker.txt'), 'A');
+
+    link.setLink(linkPath, targetA);
+
+    // Stand a real directory where the replacement wants to be built, so creating
+    // it fails the way a filesystem that refuses reparse points would.
+    fs.mkdirSync(link.stagingPath(linkPath));
+
+    assert.throws(() => link.setLink(linkPath, targetB), (err) => {
+      assert.equal(err.linkUnsupported, true);
+      return true;
+    });
+
+    // The whole point: a refused link must not cost the user their Codex home.
+    assert.equal(link.pointsTo(linkPath, targetA), true);
+    assert.equal(fs.readFileSync(path.join(linkPath, 'marker.txt'), 'utf8'), 'A');
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------------------------------------ init placeholders
+
+test('init refuses to migrate over a profile whose config the user has edited', async () => {
+  await withSandbox(async (base) => {
+    const commands = await import('../src/commands.js');
+    const registry = await import('../src/registry.js');
+    const paths = await import('../src/paths.js');
+
+    const linkPath = paths.codexLink();
+    fs.mkdirSync(linkPath, { recursive: true });
+    fs.writeFileSync(path.join(linkPath, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    fs.writeFileSync(path.join(linkPath, 'config.toml'), 'model = "gpt-5"');
+
+    const reg = registry.load();
+    registry.addProfile(reg, 'work');
+    registry.save(reg);
+    const home = paths.profileDir('work');
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, 'config.toml'), 'model = "hand-edited"');
+
+    await assert.rejects(
+      () => quiet(() => commands.init({ _: [], main: 'work', yes: true })),
+      /already holds data/,
+    );
+
+    // "only config.toml present" is not enough to call a directory disposable.
+    assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), 'model = "hand-edited"');
+    assert.ok(base);
+  });
+});
+
+test('init replaces the untouched placeholder an earlier --no-link run left behind', async () => {
+  await withSandbox(async () => {
+    const commands = await import('../src/commands.js');
+    const paths = await import('../src/paths.js');
+
+    const linkPath = paths.codexLink();
+    fs.mkdirSync(linkPath, { recursive: true });
+    fs.writeFileSync(path.join(linkPath, 'auth.json'), '{"auth_mode":"chatgpt"}');
+    fs.writeFileSync(path.join(linkPath, 'config.toml'), 'model = "gpt-5"');
+
+    // What --no-link writes: a byte-for-byte copy of the config being migrated,
+    // so removing it loses nothing the migration does not bring along.
+    const home = paths.profileDir('codex-main');
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, 'config.toml'), 'model = "gpt-5"');
+
+    const code = await quiet(() => commands.init({ _: [], yes: true }));
+
+    assert.equal(code, 0);
+    assert.equal(link.pointsTo(linkPath, home), true);
+    assert.equal(fs.readFileSync(path.join(home, 'auth.json'), 'utf8'), '{"auth_mode":"chatgpt"}');
   });
 });
