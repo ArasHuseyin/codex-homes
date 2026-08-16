@@ -1,6 +1,6 @@
 {
   "name": "codex-homes",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Switch between multiple Codex / ChatGPT accounts using fully isolated CODEX_HOME profiles",
   "keywords": [
     "codex",
