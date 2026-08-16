@@ -1,12 +1,31 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { assertValidName, codexLink, profileDir, profilesDir, registryPath, root, shimDir } from './paths.js';
+import {
+  assertCreatableName,
+  assertValidName,
+  codexLink,
+  namesEqual,
+  profileDir,
+  profilesDir,
+  registryPath,
+  root,
+  shimDir,
+} from './paths.js';
 import * as registry from './registry.js';
 import * as link from './link.js';
 import { describeAccount, readAccount } from './auth.js';
 import { codexIsRunning, codexVersion, resolveExecutable, runCodex } from './codex.js';
-import { addShimDirToUserPath, removeShim, shimDirOnPath, writeShims } from './shims.js';
+import {
+  addShimDirToUserPath,
+  removeShim,
+  shimBody,
+  shimDirOnPath,
+  shimExists,
+  shimFileName,
+  unshimmable,
+  writeShims,
+} from './shims.js';
 import { bold, confirm, cyan, dim, fail, green, info, ok, table, warn, yellow } from './ui.js';
 
 const DEFAULT_MAIN = 'codex-main';
@@ -29,6 +48,7 @@ function requireInitialised() {
   return registry.load();
 }
 
+/** Resolve a user-typed name to the registered profile it addresses. */
 function requireProfile(reg, name) {
   assertValidName(name);
   const profile = registry.findProfile(reg, name);
@@ -39,37 +59,114 @@ function requireProfile(reg, name) {
   return profile;
 }
 
+/**
+ * How this installation selects a profile.
+ *  link    — ~/.codex is a junction/symlink, one profile is active everywhere
+ *  no-link — ~/.codex was left alone, profiles are picked per command
+ *  broken  — a profile is marked active but the link is gone or misdirected
+ */
+function linkMode(reg) {
+  if (link.inspect(codexLink()).isLink) return 'link';
+  return reg.active === null ? 'no-link' : 'broken';
+}
+
+/** True when the launcher on disk matches what this version would write. */
+function shimIsCurrent(name) {
+  try {
+    return fs.readFileSync(path.join(shimDir(), shimFileName(name)), 'utf8') === shimBody(profileDir(name));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when `dir` is a placeholder an earlier `--no-link` run created, rather
+ * than a profile holding something of the user's.
+ *
+ * That run copies `~/.codex/config.toml` in and nothing else, and the migration
+ * about to happen brings the very same bytes along — so removing a byte-identical
+ * copy loses nothing. A config.toml the user has since edited is their data and
+ * is worth more than the convenience of reusing the name, "only file present" or
+ * not: comparing the contents is what separates the two.
+ */
+function isInitPlaceholder(dir, migratedConfig) {
+  let contents;
+  try {
+    contents = fs.readdirSync(dir);
+  } catch {
+    return false;
+  }
+  if (contents.length === 0) return true;
+  if (contents.length !== 1 || contents[0] !== 'config.toml') return false;
+  try {
+    return fs.readFileSync(path.join(dir, 'config.toml')).equals(fs.readFileSync(migratedConfig));
+  } catch {
+    // No config.toml coming in to compare against, so this one is not a copy of it.
+    return false;
+  }
+}
+
+function explainNoLinkMode() {
+  info('');
+  info(`${dim('no-link mode:')} ${codexLink()} is not managed, so plain "codex" keeps using it.`);
+  info(`${dim('Pick a profile per command instead — several can run at the same time:')}`);
+  info(`  ${cyan('codex-homes run <profile> -- "…"')}   ${dim('or the launchers from "codex-homes shims"')}`);
+}
+
 // ---------------------------------------------------------------- init
 
 export async function init(args) {
-  const mainName = assertValidName(args.main ?? DEFAULT_MAIN);
-  const reserveName = assertValidName(args.reserve ?? DEFAULT_RESERVE);
-  if (mainName === reserveName) throw new Error('main and reserve profiles need different names');
+  const mainName = assertCreatableName(args.main ?? DEFAULT_MAIN);
+  const reserveName = assertCreatableName(args.reserve ?? DEFAULT_RESERVE);
+  if (namesEqual(mainName, reserveName)) throw new Error('main and reserve profiles need different names');
 
   const linkPath = codexLink();
   const state = link.inspect(linkPath);
   const reg = registry.registryExists() ? registry.load() : { version: 1, active: null, profiles: [] };
 
+  let linkless = args.link === false;
+
   if (state.isLink) {
+    if (linkless) throw new Error(`${linkPath} is already a link — --no-link would leave it pointing at whatever it points at now`);
     info(`${linkPath} is already a link — nothing to migrate.`);
   } else if (state.exists && !state.isDir) {
     throw new Error(`${linkPath} exists but is a file — remove it manually first`);
   }
 
-  const willMigrate = state.exists && !state.isLink;
+  const willMigrate = !linkless && state.exists && !state.isLink;
   const mainTarget = profileDir(mainName);
+  const reserveTarget = profileDir(reserveName);
+
+  // Decided before the plan is printed, so the removal is something the user is
+  // shown and agrees to, and a refusal arrives before the prompts, not after them.
+  let replacePlaceholder = false;
+  if (willMigrate && fs.existsSync(mainTarget)) {
+    replacePlaceholder = isInitPlaceholder(mainTarget, path.join(linkPath, 'config.toml'));
+    if (!replacePlaceholder) {
+      throw new Error(
+        `profile "${mainName}" already holds data at ${mainTarget} — ` +
+          `pass --main <name> to migrate ${linkPath} into a different profile`,
+      );
+    }
+  }
 
   info('');
   info(bold('Plan'));
   info(`  profiles root   ${cyan(profilesDir())}`);
-  if (willMigrate) {
+  if (linkless) {
+    info(`  keep as is      ${linkPath} ${dim('(stays your unmanaged default account)')}`);
+    info(`  create          ${mainTarget} ${dim('(empty)')}`);
+  } else if (willMigrate) {
+    if (replacePlaceholder) {
+      info(`  replace         ${mainTarget} ${dim('(placeholder from an earlier --no-link run)')}`);
+    }
     info(`  migrate         ${linkPath}  ->  ${mainTarget}`);
     info(`  then link       ${linkPath}  ->  ${mainTarget}`);
   } else if (!state.exists) {
     info(`  create          ${mainTarget} ${dim('(empty)')}`);
     info(`  then link       ${linkPath}  ->  ${mainTarget}`);
   }
-  info(`  create          ${profileDir(reserveName)} ${dim('(empty)')}`);
+  info(`  create          ${reserveTarget} ${dim('(empty)')}`);
   info('');
 
   if (willMigrate && codexIsRunning()) {
@@ -87,33 +184,70 @@ export async function init(args) {
 
   registry.ensureDirs();
 
-  if (willMigrate) {
-    link.migrateDirToProfile(linkPath, mainTarget);
-    ok(`migrated existing Codex home into profile "${mainName}"`);
-  } else if (!state.exists) {
-    fs.mkdirSync(mainTarget, { recursive: true });
-    link.setLink(linkPath, mainTarget);
-    ok(`created empty profile "${mainName}"`);
-  }
+  // migrateDirToProfile renames onto this path, so the placeholder has to go first.
+  if (replacePlaceholder) fs.rmSync(mainTarget, { recursive: true, force: true });
 
-  if (!registry.findProfile(reg, mainName)) registry.addProfile(reg, mainName, 'migrated by init');
+  let mainCreated = false;
 
-  const reserveTarget = profileDir(reserveName);
-  if (!fs.existsSync(reserveTarget)) fs.mkdirSync(reserveTarget, { recursive: true });
-  if (!registry.findProfile(reg, reserveName)) registry.addProfile(reg, reserveName);
-  ok(`created profile "${reserveName}"`);
-
-  // Keep model/tool settings identical across profiles unless told otherwise.
-  if (args.copyConfig !== false) {
-    const from = path.join(mainTarget, 'config.toml');
-    const to = path.join(reserveTarget, 'config.toml');
-    if (fs.existsSync(from) && !fs.existsSync(to)) {
-      fs.copyFileSync(from, to);
-      ok(`copied config.toml to "${reserveName}"`);
+  if (!linkless) {
+    try {
+      if (willMigrate) {
+        link.migrateDirToProfile(linkPath, mainTarget);
+        ok(`migrated existing Codex home into profile "${mainName}"`);
+      } else if (!state.exists) {
+        mainCreated = !fs.existsSync(mainTarget);
+        fs.mkdirSync(mainTarget, { recursive: true });
+        link.setLink(linkPath, mainTarget);
+        ok(`created empty profile "${mainName}"`);
+      }
+    } catch (err) {
+      if (!err.linkUnsupported) throw err;
+      info('');
+      fail(err.message);
+      info('');
+      warn(`continuing without the link — ${linkPath} stays exactly as it is.`);
+      if (!args.yes && !(await confirm('Set the profiles up in no-link mode?', true))) {
+        info('aborted.');
+        return 1;
+      }
+      linkless = true;
     }
   }
 
-  if (state.isLink) {
+  if (linkless && !fs.existsSync(mainTarget)) {
+    fs.mkdirSync(mainTarget, { recursive: true });
+    mainCreated = true;
+  }
+  if (linkless && mainCreated) ok(`created profile "${mainName}"`);
+
+  if (!registry.findProfile(reg, mainName)) {
+    registry.addProfile(reg, mainName, linkless ? '' : 'migrated by init');
+  }
+
+  if (!fs.existsSync(reserveTarget)) {
+    fs.mkdirSync(reserveTarget, { recursive: true });
+    ok(`created profile "${reserveName}"`);
+  }
+  if (!registry.findProfile(reg, reserveName)) registry.addProfile(reg, reserveName);
+
+  // Keep model/tool settings identical across profiles unless told otherwise.
+  // In no-link mode ~/.codex was never moved, so that is where the config sits.
+  if (args.copyConfig !== false) {
+    const from = linkless && state.exists ? path.join(linkPath, 'config.toml') : path.join(mainTarget, 'config.toml');
+    if (fs.existsSync(from)) {
+      for (const target of linkless ? [mainTarget, reserveTarget] : [reserveTarget]) {
+        const to = path.join(target, 'config.toml');
+        if (!fs.existsSync(to)) {
+          fs.copyFileSync(from, to);
+          ok(`copied config.toml to "${path.basename(target)}"`);
+        }
+      }
+    }
+  }
+
+  if (linkless) {
+    reg.active = null;
+  } else if (state.isLink) {
     const active = reg.profiles.find((p) => link.pointsTo(linkPath, profileDir(p.name)));
     reg.active = active ? active.name : reg.active;
   } else {
@@ -124,12 +258,22 @@ export async function init(args) {
   writeShims(reg.profiles.map((p) => p.name));
 
   info('');
-  ok(`active profile: ${bold(reg.active ?? mainName)}`);
-  info('');
-  info('Next steps:');
-  info(`  1. ${cyan(`codex-homes use ${reserveName}`)}   switch to the empty profile`);
-  info(`  2. ${cyan('codex login')}                        log in with your second account`);
-  info(`  3. ${cyan(`codex-homes use ${mainName}`)}      switch back`);
+  if (linkless) {
+    explainNoLinkMode();
+    info('');
+    info('Next steps:');
+    info(`  1. ${cyan(`codex-homes login ${mainName}`)}      log in with your first account`);
+    info(`  2. ${cyan(`codex-homes login ${reserveName}`)}   log in with your second account`);
+    info(`  3. ${cyan(`codex-homes run ${reserveName} -- "review this diff"`)}`);
+    info(`  4. ${cyan('codex-homes shims --path')}            one command per account`);
+  } else {
+    ok(`active profile: ${bold(reg.active ?? mainName)}`);
+    info('');
+    info('Next steps:');
+    info(`  1. ${cyan(`codex-homes use ${reserveName}`)}   switch to the empty profile`);
+    info(`  2. ${cyan('codex login')}                        log in with your second account`);
+    info(`  3. ${cyan(`codex-homes use ${mainName}`)}      switch back`);
+  }
   info('');
   warnAboutEnvOverride();
   return 0;
@@ -140,6 +284,7 @@ export async function init(args) {
 export function list(args) {
   const reg = requireInitialised();
   const linkPath = codexLink();
+  const mode = linkMode(reg);
 
   if (args.json) {
     const payload = reg.profiles.map((p) => {
@@ -147,7 +292,7 @@ export function list(args) {
       const account = readAccount(home);
       return {
         name: p.name,
-        active: reg.active === p.name,
+        active: namesEqual(reg.active, p.name),
         home,
         exists: fs.existsSync(home),
         account: {
@@ -158,7 +303,7 @@ export function list(args) {
         },
       };
     });
-    info(JSON.stringify({ link: linkPath, active: reg.active, profiles: payload }, null, 2));
+    info(JSON.stringify({ link: linkPath, mode, active: reg.active, profiles: payload }, null, 2));
     return 0;
   }
 
@@ -170,7 +315,7 @@ export function list(args) {
   const rows = reg.profiles.map((p) => {
     const home = profileDir(p.name);
     const account = readAccount(home);
-    const isActive = reg.active === p.name;
+    const isActive = namesEqual(reg.active, p.name);
     const marker = isActive ? green('*') : ' ';
     const name = isActive ? bold(p.name) : p.name;
     const missing = fs.existsSync(home) ? '' : yellow(' (dir missing)');
@@ -186,8 +331,12 @@ export function list(args) {
   info('');
   table(['', 'PROFILE', 'ACCOUNT', 'PLAN', 'STATE'], rows);
   info('');
-  const activeHome = reg.active ? profileDir(reg.active) : null;
-  info(`${dim('codex home')}  ${linkPath} ${dim('->')} ${activeHome ?? dim('(none)')}`);
+  if (mode === 'no-link') {
+    info(`${dim('codex home')}  ${linkPath} ${dim('(unmanaged — profiles are selected per command)')}`);
+  } else {
+    const activeHome = reg.active ? profileDir(reg.active) : null;
+    info(`${dim('codex home')}  ${linkPath} ${dim('->')} ${activeHome ?? dim('(none)')}`);
+  }
   warnAboutEnvOverride();
   return 0;
 }
@@ -195,24 +344,25 @@ export function list(args) {
 // ---------------------------------------------------------------- use
 
 export async function use(args) {
-  const name = args._[0];
-  if (!name) throw new Error('usage: codex-homes use <profile>');
+  const requested = args._[0];
+  if (!requested) throw new Error('usage: codex-homes use <profile>');
 
   const reg = requireInitialised();
-  requireProfile(reg, name);
+  const name = requireProfile(reg, requested).name;
 
   const home = profileDir(name);
   if (!fs.existsSync(home)) {
     throw new Error(`profile directory is missing: ${home} — run "codex-homes doctor --fix"`);
   }
 
-  if (reg.active === name && link.pointsTo(codexLink(), home)) {
+  if (namesEqual(reg.active, name) && link.pointsTo(codexLink(), home)) {
     ok(`already using ${bold(name)}`);
     return 0;
   }
 
   if (codexIsRunning() && !args.yes) {
     warn('a codex process is running — switching now can confuse that session.');
+    info(`   ${dim(`sessions started with "codex-homes run" or a shim are pinned and unaffected`)}`);
     if (!(await confirm('Switch anyway?', false))) {
       info('aborted.');
       return 1;
@@ -235,11 +385,11 @@ export async function use(args) {
 // ---------------------------------------------------------------- run
 
 export async function runIn(args) {
-  const name = args._[0];
-  if (!name) throw new Error('usage: codex-homes run <profile> [-- <codex args>]');
+  const requested = args._[0];
+  if (!requested) throw new Error('usage: codex-homes run <profile> [-- <codex args>]');
 
   const reg = requireInitialised();
-  requireProfile(reg, name);
+  const name = requireProfile(reg, requested).name;
 
   const home = profileDir(name);
   if (!fs.existsSync(home)) throw new Error(`profile directory is missing: ${home}`);
@@ -250,10 +400,10 @@ export async function runIn(args) {
 // ---------------------------------------------------------------- login / logout
 
 export async function login(args) {
-  const name = args._[0];
-  if (!name) throw new Error('usage: codex-homes login <profile>');
+  const requested = args._[0];
+  if (!requested) throw new Error('usage: codex-homes login <profile>');
   const reg = requireInitialised();
-  requireProfile(reg, name);
+  const name = requireProfile(reg, requested).name;
 
   const home = profileDir(name);
   fs.mkdirSync(home, { recursive: true });
@@ -267,10 +417,10 @@ export async function login(args) {
 }
 
 export async function logout(args) {
-  const name = args._[0];
-  if (!name) throw new Error('usage: codex-homes logout <profile>');
+  const requested = args._[0];
+  if (!requested) throw new Error('usage: codex-homes logout <profile>');
   const reg = requireInitialised();
-  requireProfile(reg, name);
+  const name = requireProfile(reg, requested).name;
   return runCodex(['logout'], profileDir(name));
 }
 
@@ -279,18 +429,18 @@ export async function logout(args) {
 export function add(args) {
   const name = args._[0];
   if (!name) throw new Error('usage: codex-homes add <profile>');
-  assertValidName(name);
+  assertCreatableName(name);
 
   const reg = requireInitialised();
   registry.addProfile(reg, name, args.note ?? '');
   fs.mkdirSync(profileDir(name), { recursive: true });
 
   if (args.from) {
-    requireProfile(reg, args.from);
-    const source = path.join(profileDir(args.from), 'config.toml');
+    const from = requireProfile(reg, args.from).name;
+    const source = path.join(profileDir(from), 'config.toml');
     if (fs.existsSync(source)) {
       fs.copyFileSync(source, path.join(profileDir(name), 'config.toml'));
-      ok(`copied config.toml from "${args.from}"`);
+      ok(`copied config.toml from "${from}"`);
     }
   }
 
@@ -302,13 +452,13 @@ export function add(args) {
 }
 
 export async function remove(args) {
-  const name = args._[0];
-  if (!name) throw new Error('usage: codex-homes remove <profile> [--purge]');
+  const requested = args._[0];
+  if (!requested) throw new Error('usage: codex-homes remove <profile> [--purge]');
 
   const reg = requireInitialised();
-  requireProfile(reg, name);
+  const name = requireProfile(reg, requested).name;
 
-  if (reg.active === name) {
+  if (namesEqual(reg.active, name)) {
     throw new Error(`"${name}" is the active profile — switch to another one first`);
   }
 
@@ -340,11 +490,13 @@ export function status() {
   const reg = requireInitialised();
   const linkPath = codexLink();
   const state = link.inspect(linkPath);
+  const mode = linkMode(reg);
   const activeHome = reg.active ? profileDir(reg.active) : null;
   const account = activeHome ? readAccount(activeHome) : null;
 
   info('');
-  info(`${bold('active profile')}   ${reg.active ? green(reg.active) : yellow('none')}`);
+  info(`${bold('mode')}             ${mode === 'no-link' ? yellow('no-link (per command)') : mode === 'broken' ? yellow('link missing') : green('link')}`);
+  info(`${bold('active profile')}   ${reg.active ? green(reg.active) : dim('none (selected per command)')}`);
   if (account) {
     info(`${bold('account')}          ${describeAccount(account)}`);
     if (account.plan) info(`${bold('plan')}             ${account.plan}`);
@@ -356,12 +508,16 @@ export function status() {
   }
   info('');
   info(`${bold('codex home')}       ${linkPath}`);
-  info(`${bold('link state')}       ${state.isLink ? green('junction') : yellow(state.exists ? 'real directory' : 'missing')}`);
+  info(
+    `${bold('link state')}       ${state.isLink ? green(process.platform === 'win32' ? 'junction' : 'symlink') : yellow(state.exists ? 'real directory' : 'missing')}`,
+  );
   if (state.isLink && state.target) info(`${bold('points to')}        ${state.target}`);
   info(`${bold('profiles root')}    ${profilesDir()}`);
+  info(`${bold('shims on PATH')}    ${shimDirOnPath() ? green('yes') : dim('no')}`);
   info('');
   info(`${bold('codex binary')}     ${resolveExecutable('codex') ?? yellow('not found on PATH')}`);
   info(`${bold('codex version')}    ${codexVersion() ?? dim('-')}`);
+  if (mode === 'no-link') explainNoLinkMode();
   info('');
   warnAboutEnvOverride();
   return 0;
@@ -370,7 +526,12 @@ export function status() {
 // ---------------------------------------------------------------- doctor
 
 export async function doctor(args) {
+  /** @type {{text: string, fixed: boolean}[]} */
   const problems = [];
+  const note = (text) => problems.push({ text, fixed: false });
+  const resolveLast = () => {
+    problems[problems.length - 1].fixed = true;
+  };
   const fixes = [];
   const linkPath = codexLink();
 
@@ -379,37 +540,52 @@ export async function doctor(args) {
     return 1;
   }
   const reg = registry.load();
+  const mode = linkMode(reg);
 
   info('');
   info(bold('Checks'));
 
   // 1. CODEX_HOME override
   if (process.env.CODEX_HOME) {
-    problems.push(`CODEX_HOME is set to ${process.env.CODEX_HOME} and overrides the active profile`);
+    note(`CODEX_HOME is set to ${process.env.CODEX_HOME} and overrides the active profile`);
     info(`  ${yellow('!!')} CODEX_HOME env var is set — it overrides everything codex-homes does`);
   } else {
     info(`  ${green('OK')} CODEX_HOME env var is not set`);
   }
 
-  // 2. link health
+  // 2. link health — only a problem when this install is meant to have a link
   const state = link.inspect(linkPath);
   const activeHome = reg.active ? profileDir(reg.active) : null;
-  if (!state.exists) {
-    problems.push(`${linkPath} does not exist`);
+  if (mode === 'no-link') {
+    info(`  ${dim('--')} no-link mode: ${linkPath} is not managed, profiles are selected per command`);
+  } else if (!state.exists) {
+    note(`${linkPath} does not exist`);
     info(`  ${yellow('!!')} ${linkPath} is missing`);
     if (args.fix && activeHome && fs.existsSync(activeHome)) {
-      link.setLink(linkPath, activeHome);
-      fixes.push(`recreated link -> ${activeHome}`);
+      // A machine that refuses reparse points is the reason the link is missing
+      // as often as not, so report that instead of aborting the whole checkup.
+      try {
+        link.setLink(linkPath, activeHome);
+        fixes.push(`recreated link -> ${activeHome}`);
+        resolveLast();
+      } catch (err) {
+        info(`  ${yellow('!!')} could not recreate the link: ${err.message}`);
+      }
     }
   } else if (!state.isLink) {
-    problems.push(`${linkPath} is a real directory, not a link — run "codex-homes init"`);
+    note(`${linkPath} is a real directory, not a link — run "codex-homes init"`);
     info(`  ${yellow('!!')} ${linkPath} is a real directory (not managed by codex-homes)`);
   } else if (activeHome && !link.pointsTo(linkPath, activeHome)) {
-    problems.push(`${linkPath} does not point at the active profile "${reg.active}"`);
+    note(`${linkPath} does not point at the active profile "${reg.active}"`);
     info(`  ${yellow('!!')} link points at ${state.target}, expected ${activeHome}`);
     if (args.fix) {
-      link.setLink(linkPath, activeHome);
-      fixes.push(`repointed link -> ${activeHome}`);
+      try {
+        link.setLink(linkPath, activeHome);
+        fixes.push(`repointed link -> ${activeHome}`);
+        resolveLast();
+      } catch (err) {
+        info(`  ${yellow('!!')} could not repoint the link: ${err.message}`);
+      }
     }
   } else {
     info(`  ${green('OK')} ${linkPath} points at the active profile`);
@@ -418,11 +594,12 @@ export async function doctor(args) {
   // 3. missing / orphaned profile directories
   const missing = registry.missingDirs(reg);
   if (missing.length) {
-    problems.push(`registered but missing on disk: ${missing.join(', ')}`);
+    note(`registered but missing on disk: ${missing.join(', ')}`);
     info(`  ${yellow('!!')} missing directories: ${missing.join(', ')}`);
     if (args.fix) {
       for (const name of missing) fs.mkdirSync(profileDir(name), { recursive: true });
       fixes.push(`recreated ${missing.length} profile directory/-ies`);
+      resolveLast();
     }
   } else {
     info(`  ${green('OK')} every registered profile has a directory`);
@@ -430,18 +607,23 @@ export async function doctor(args) {
 
   const orphans = registry.orphanDirs(reg);
   if (orphans.length) {
-    problems.push(`unregistered profile directories: ${orphans.join(', ')}`);
+    note(`unregistered profile directories: ${orphans.join(', ')}`);
     info(`  ${yellow('!!')} unregistered directories: ${orphans.join(', ')}`);
     if (args.fix) {
+      let recovered = 0;
       for (const name of orphans) {
         try {
           registry.addProfile(reg, name, 'recovered by doctor');
+          recovered += 1;
         } catch {
-          /* invalid name, skip */
+          /* name is not usable as a profile, leave the directory alone */
         }
       }
       registry.save(reg);
-      fixes.push(`registered ${orphans.length} orphaned directory/-ies`);
+      if (recovered) {
+        fixes.push(`registered ${recovered} orphaned directory/-ies`);
+        if (recovered === orphans.length) resolveLast();
+      }
     }
   } else {
     info(`  ${green('OK')} no unregistered profile directories`);
@@ -451,11 +633,39 @@ export async function doctor(args) {
   if (resolveExecutable('codex')) {
     info(`  ${green('OK')} codex found on PATH`);
   } else {
-    problems.push('codex is not on PATH');
+    note('codex is not on PATH');
     info(`  ${yellow('!!')} codex not found on PATH`);
   }
 
-  // 5. shims
+  // 5. shims — stale launchers are how "run under the other account" goes wrong
+  const allNames = reg.profiles.map((p) => p.name);
+  const reservedNames = unshimmable(allNames);
+  const staleShims = allNames.filter((name) => !reservedNames.includes(name) && !shimIsCurrent(name));
+  if (staleShims.length) {
+    note(`launcher missing or outdated for: ${staleShims.join(', ')}`);
+    info(`  ${yellow('!!')} launcher missing or outdated: ${staleShims.join(', ')}`);
+    if (args.fix) {
+      writeShims(allNames);
+      fixes.push(`rewrote ${staleShims.length} launcher(s)`);
+      resolveLast();
+    }
+  } else {
+    info(`  ${green('OK')} every profile has an up-to-date launcher`);
+  }
+
+  // Names that predate the reserved-name check. Renaming is the user's call, so
+  // this stays unresolved, but the self-calling launcher itself is removable.
+  if (reservedNames.length) {
+    note(`launcher would shadow the command it calls, so these profiles get none: ${reservedNames.join(', ')}`);
+    info(`  ${yellow('!!')} no launcher for: ${reservedNames.join(', ')} ${dim('(the name shadows the command it runs)')}`);
+    info(`     ${dim(`rename with "codex-homes add <new-name> --from <old>", then "codex-homes remove <old>"`)}`);
+    const looping = reservedNames.filter((name) => shimExists(name));
+    if (args.fix && looping.length) {
+      for (const name of looping) removeShim(name);
+      fixes.push(`removed ${looping.length} self-calling launcher(s): ${looping.join(', ')}`);
+    }
+  }
+
   if (shimDirOnPath()) {
     info(`  ${green('OK')} shim directory is on PATH`);
   } else {
@@ -467,29 +677,30 @@ export async function doctor(args) {
     for (const f of fixes) ok(f);
     info('');
   }
-  if (problems.length === 0) {
+  const unresolved = problems.filter((p) => !p.fixed);
+  if (unresolved.length === 0) {
     ok('everything looks healthy');
     return 0;
   }
   if (!args.fix) info(dim('run "codex-homes doctor --fix" to repair what can be repaired'));
-  return problems.length && !fixes.length ? 1 : 0;
+  return 1;
 }
 
 // ---------------------------------------------------------------- config-sync
 
 export async function configSync(args) {
-  const [from, ...targets] = args._;
-  if (!from) throw new Error('usage: codex-homes config-sync <from> [to...] (default: all others)');
+  const [requested, ...targets] = args._;
+  if (!requested) throw new Error('usage: codex-homes config-sync <from> [to...] (default: all others)');
 
   const reg = requireInitialised();
-  requireProfile(reg, from);
+  const from = requireProfile(reg, requested).name;
 
   const source = path.join(profileDir(from), 'config.toml');
   if (!fs.existsSync(source)) throw new Error(`"${from}" has no config.toml at ${source}`);
 
   const destinations = targets.length
     ? targets.map((t) => requireProfile(reg, t).name)
-    : reg.profiles.map((p) => p.name).filter((n) => n !== from);
+    : reg.profiles.map((p) => p.name).filter((n) => !namesEqual(n, from));
 
   if (destinations.length === 0) {
     warn('no target profiles');
@@ -516,10 +727,21 @@ export async function configSync(args) {
 
 export function shims(args) {
   const reg = requireInitialised();
-  const written = writeShims(reg.profiles.map((p) => p.name));
+  const names = reg.profiles.map((p) => p.name);
+  const written = writeShims(names);
 
   ok(`wrote ${written.length} launcher(s) into ${shimDir()}`);
   for (const file of written) info(`   ${dim(path.basename(file))}`);
+
+  const skipped = unshimmable(names);
+  if (skipped.length) {
+    info('');
+    warn(
+      `no launcher for ${skipped.join(', ')} — a launcher of that name would shadow the\n` +
+        `   command it calls, and this directory goes on the front of your PATH.\n` +
+        `   Rename with "codex-homes add <new-name> --from <old>", then "codex-homes remove <old>".`,
+    );
+  }
 
   if (args.path) {
     const result = addShimDirToUserPath();
@@ -533,7 +755,10 @@ export function shims(args) {
   }
 
   info('');
-  info(`Then: ${cyan(`${reg.profiles[0]?.name ?? 'codex-main'} "explain this repo"`)}`);
+  const example = names.find((name) => !skipped.includes(name)) ?? 'codex-main';
+  info(`Then: ${cyan(`${example} "explain this repo"`)}`);
+  info(dim('Each launcher sets CODEX_HOME for its own process, so one terminal per'));
+  info(dim('account can run at the same time without them seeing each other.'));
   return 0;
 }
 
@@ -545,16 +770,24 @@ export function shims(args) {
  */
 export async function restore(args) {
   const reg = requireInitialised();
-  const name = args._[0] ?? reg.active;
-  if (!name) throw new Error('no active profile — pass one explicitly: codex-homes restore <profile>');
-  requireProfile(reg, name);
+  const requested = args._[0] ?? reg.active;
+  if (!requested) {
+    throw new Error(
+      'no active profile — pass one explicitly: codex-homes restore <profile>',
+    );
+  }
+  const name = requireProfile(reg, requested).name;
 
   const linkPath = codexLink();
   const home = profileDir(name);
   const state = link.inspect(linkPath);
 
   if (!state.isLink) {
-    throw new Error(`${linkPath} is not managed by codex-homes (it is not a link) — nothing to restore`);
+    throw new Error(
+      `${linkPath} is not managed by codex-homes (it is not a link) — nothing to restore.\n` +
+        `  To drop a profile in no-link mode use "codex-homes remove ${name} --purge",\n` +
+        `  or move ${home} wherever you want it.`,
+    );
   }
   if (!fs.existsSync(home)) throw new Error(`profile directory is missing: ${home}`);
 
@@ -603,10 +836,11 @@ export async function restore(args) {
 
 export function printPath(args) {
   const reg = requireInitialised();
-  const name = args._[0] ?? reg.active;
-  if (!name) throw new Error('no active profile');
-  requireProfile(reg, name);
-  info(profileDir(name));
+  const requested = args._[0] ?? reg.active;
+  if (!requested) {
+    throw new Error('no active profile — pass one explicitly: codex-homes path <profile>');
+  }
+  info(profileDir(requireProfile(reg, requested).name));
   return 0;
 }
 
