@@ -1,6 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { assertValidName, profileDir, profilesDir, registryPath, root } from './paths.js';
+import {
+  assertCreatableName,
+  namesEqual,
+  profileDir,
+  profilesDir,
+  registryPath,
+  root,
+} from './paths.js';
 
 const CURRENT_VERSION = 1;
 
@@ -43,23 +50,63 @@ export function load() {
   return registry;
 }
 
-/** Write atomically so an interrupted write cannot corrupt the registry. */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Write atomically so an interrupted write cannot corrupt the registry.
+ * The temp file carries the pid so two codex-homes processes running side by
+ * side never write the same scratch path, and the rename is retried because
+ * on Windows a virus scanner holding the target open surfaces as EPERM.
+ */
 export function save(registry) {
   fs.mkdirSync(root(), { recursive: true });
   const file = registryPath();
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, file);
+
+  let lastError;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return registry;
+    } catch (err) {
+      lastError = err;
+      if (err.code !== 'EPERM' && err.code !== 'EACCES' && err.code !== 'EBUSY') break;
+      sleepSync(50 * (attempt + 1));
+    }
+  }
+  try {
+    fs.unlinkSync(tmp);
+  } catch {
+    /* nothing left to clean up */
+  }
+  throw lastError;
 }
 
+/**
+ * Look a profile up. Falls back to a filesystem-equivalent match so that on
+ * Windows `use WORK` finds the profile registered as `work` — the two share one
+ * directory there, and reporting "unknown profile" would be a lie.
+ */
 export function findProfile(registry, name) {
-  return registry.profiles.find((p) => p.name === name) ?? null;
+  return (
+    registry.profiles.find((p) => p.name === name) ??
+    registry.profiles.find((p) => namesEqual(p.name, name)) ??
+    null
+  );
 }
 
 export function addProfile(registry, name, note = '') {
-  assertValidName(name);
-  if (findProfile(registry, name)) {
-    throw new Error(`profile "${name}" already exists`);
+  assertCreatableName(name);
+  const existing = findProfile(registry, name);
+  if (existing) {
+    throw new Error(
+      existing.name === name
+        ? `profile "${name}" already exists`
+        : `profile "${existing.name}" already exists — on this filesystem "${name}" would share its directory`,
+    );
   }
   registry.profiles.push({ name, created: new Date().toISOString(), note });
   return registry;
@@ -67,11 +114,11 @@ export function addProfile(registry, name, note = '') {
 
 export function removeProfile(registry, name) {
   const before = registry.profiles.length;
-  registry.profiles = registry.profiles.filter((p) => p.name !== name);
+  registry.profiles = registry.profiles.filter((p) => !namesEqual(p.name, name));
   if (registry.profiles.length === before) {
     throw new Error(`profile "${name}" is not registered`);
   }
-  if (registry.active === name) registry.active = null;
+  if (namesEqual(registry.active, name)) registry.active = null;
   return registry;
 }
 
@@ -79,10 +126,9 @@ export function removeProfile(registry, name) {
 export function orphanDirs(registry) {
   const dir = profilesDir();
   if (!fs.existsSync(dir)) return [];
-  const known = new Set(registry.profiles.map((p) => p.name));
   return fs
     .readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && !known.has(e.name))
+    .filter((e) => e.isDirectory() && !registry.profiles.some((p) => namesEqual(p.name, e.name)))
     .map((e) => e.name);
 }
 

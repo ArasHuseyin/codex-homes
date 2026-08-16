@@ -83,6 +83,7 @@ ${bold('SETUP')}
   init                     Migrate ~/.codex into a profile and set up the link
     --main <name>            name for the migrated profile   ${dim('(default: codex-main)')}
     --reserve <name>         name for the second profile      ${dim('(default: codex-reserve)')}
+    --no-link                leave ~/.codex alone; select profiles per command
     --no-copy-config         do not copy config.toml to the new profile
     -y, --yes                skip confirmation
 
@@ -116,6 +117,12 @@ ${bold('NOTES')}
   Profiles live in ~/.codex-homes/profiles/<name> and each one is a full
   CODEX_HOME: its own login, config.toml, sessions, history and MCP setup.
   ~/.codex becomes a junction (Windows) or symlink (POSIX) to the active one.
+  Where that is not possible — a home directory on a network share, a locked
+  down work machine — "init --no-link" leaves ~/.codex alone and you pick the
+  profile per command instead.
+
+  "run" and the generated shims set CODEX_HOME for a single process, so any
+  number of Codex sessions can run side by side, each on its own account.
   A CODEX_HOME variable set in your shell overrides all of this.
 `);
   return 0;

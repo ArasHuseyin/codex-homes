@@ -7,6 +7,9 @@ import path from 'node:path';
 import { parseArgs } from '../src/cli.js';
 import * as link from '../src/link.js';
 import { readAccount } from '../src/auth.js';
+import { buildCmdPayload, quoteForCmd } from '../src/codex.js';
+import { assertCreatableName, caseInsensitiveFs, sameFsName, splitPathEntries } from '../src/paths.js';
+import { buildUserPathScript, shimBody, shimFileName } from '../src/shims.js';
 
 function tempDir(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `codex-homes-${label}-`));
@@ -256,5 +259,161 @@ test('registry rejects path-traversing profile names', async () => {
     for (const bad of ['..', '../evil', 'a/b', 'a\\b', '', '.hidden']) {
       assert.throws(() => registry.addProfile(reg, bad), /invalid profile name/);
     }
+  });
+});
+
+// ------------------------------------------------------------------ names
+
+test('assertCreatableName rejects names Windows or the shims cannot carry', () => {
+  for (const good of ['codex-main', 'work', 'a', 'a.b_c-1']) {
+    assert.equal(assertCreatableName(good), good);
+  }
+  // A launcher called "codex" would sit on PATH and shadow the binary it calls.
+  assert.throws(() => assertCreatableName('codex'), /shadow/);
+  assert.throws(() => assertCreatableName('CODEX'), /shadow|invalid/);
+  assert.throws(() => assertCreatableName('con'), /device/);
+  assert.throws(() => assertCreatableName('LPT1'), /device/);
+  assert.throws(() => assertCreatableName('nul.txt'), /device/);
+  assert.throws(() => assertCreatableName('trailing.'), /trailing dot/);
+  assert.throws(() => assertCreatableName('../evil'), /invalid profile name/);
+});
+
+test('sameFsName follows the filesystem it is told about', () => {
+  assert.equal(sameFsName('Work', 'work', true), true);
+  assert.equal(sameFsName('Work', 'work', false), false);
+  assert.equal(sameFsName('work', 'work', false), true);
+});
+
+// ------------------------------------------------------------------ PATH parsing
+
+test('splitPathEntries unwraps quoted and padded Windows entries', () => {
+  const entries = splitPathEntries('C:\\a; "C:\\Program Files\\node" ;;C:\\b', 'win32');
+  assert.deepEqual(entries, ['C:\\a', 'C:\\Program Files\\node', 'C:\\b']);
+});
+
+test('splitPathEntries leaves POSIX entries alone', () => {
+  assert.deepEqual(splitPathEntries('/usr/bin:/opt/x:', 'linux'), ['/usr/bin', '/opt/x']);
+});
+
+// ------------------------------------------------------------------ shims
+
+test('the Windows launcher calls codex and forwards its exit code', () => {
+  const body = shimBody('C:\\Users\\me\\.codex-homes\\profiles\\work', 'win32');
+  assert.equal(shimFileName('work', 'win32'), 'work.cmd');
+  // Without "call", codex.cmd would chain and endlocal would never run.
+  assert.match(body, /^call codex %\*$/m);
+  assert.match(body, /^endlocal & exit \/b %ERRORLEVEL%$/m);
+  assert.match(body, /^set "CODEX_HOME=C:\\Users\\me\\\.codex-homes\\profiles\\work"$/m);
+  assert.ok(body.includes('\r\n'), 'batch files need CRLF');
+});
+
+test('the Windows launcher escapes percent signs in the profile path', () => {
+  const body = shimBody('C:\\odd%name\\work', 'win32');
+  assert.match(body, /^set "CODEX_HOME=C:\\odd%%name\\work"$/m);
+});
+
+test('the POSIX launcher quotes the profile path', () => {
+  const body = shimBody("/home/me/it's/work", 'linux');
+  assert.equal(shimFileName('work', 'linux'), 'work');
+  assert.match(body, /^CODEX_HOME='\/home\/me\/it'\\''s\/work'$/m);
+  assert.match(body, /^exec codex "\$@"$/m);
+  assert.ok(!body.includes('\r'), 'shell scripts must not carry CRLF');
+});
+
+test('the user-PATH script embeds the directory instead of reading $args', () => {
+  const script = buildUserPathScript("C:\\Users\\o'brien\\.codex-homes\\bin");
+  // -Command appends trailing arguments to the command text rather than binding
+  // them to $args, so the directory has to be part of the script itself.
+  assert.ok(!script.includes('$args'), 'the script must not depend on $args');
+  assert.match(script, /\$dir = 'C:\\Users\\o''brien\\\.codex-homes\\bin'/);
+  // Reading through [Environment] would expand %USERPROFILE% and freeze it.
+  assert.match(script, /DoNotExpandEnvironmentNames/);
+  assert.match(script, /GetValueKind\('Path'\)/);
+});
+
+// ------------------------------------------------------------------ cmd quoting
+
+test('cmd payload keeps a quoted executable path in one piece', () => {
+  assert.equal(quoteForCmd('plain'), 'plain');
+  assert.equal(quoteForCmd(''), '""');
+  assert.equal(quoteForCmd('has space'), '"has space"');
+  const payload = buildCmdPayload('C:\\Program Files\\nodejs\\codex.cmd', ['fix the test']);
+  assert.equal(payload, '""C:\\Program Files\\nodejs\\codex.cmd" "fix the test""');
+});
+
+// ------------------------------------------------------------------ link failures
+
+test('inspect treats a non-directory path component as absent', () => {
+  const base = tempDir('link-notdir');
+  try {
+    const file = path.join(base, 'file');
+    fs.writeFileSync(file, 'x');
+    assert.deepEqual(link.inspect(path.join(file, 'child')), {
+      exists: false,
+      isLink: false,
+      isDir: false,
+      target: null,
+    });
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('setLink reports an unusable location as a link failure with a way out', () => {
+  const base = tempDir('link-unsupported');
+  try {
+    const target = path.join(base, 'profile');
+    fs.mkdirSync(target);
+    const blocked = path.join(base, 'blocked');
+    fs.writeFileSync(blocked, 'not a directory');
+
+    try {
+      link.setLink(path.join(blocked, '.codex'), target);
+      assert.fail('expected setLink to throw');
+    } catch (err) {
+      // init keys off this flag to offer no-link mode instead of giving up.
+      assert.equal(err.linkUnsupported, true);
+      assert.match(err.message, /--no-link/);
+    }
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------------------------------------ registry
+
+test('registry resolves and rejects names the way the filesystem does', async () => {
+  await withSandbox(async () => {
+    const registry = await import(`../src/registry.js?t=${Date.now()}-c`);
+    const reg = registry.load();
+    registry.addProfile(reg, 'work');
+
+    if (caseInsensitiveFs) {
+      // "Work" and "work" would share one directory here, so it must not register twice.
+      assert.throws(() => registry.addProfile(reg, 'Work'), /already exists/);
+      assert.equal(registry.findProfile(reg, 'WORK')?.name, 'work');
+    } else {
+      registry.addProfile(reg, 'Work');
+      assert.equal(registry.findProfile(reg, 'Work')?.name, 'Work');
+      assert.equal(registry.findProfile(reg, 'WORK'), null);
+    }
+  });
+});
+
+test('registry.save leaves no scratch file behind', async () => {
+  await withSandbox(async () => {
+    const registry = await import(`../src/registry.js?t=${Date.now()}-d`);
+    const paths = await import(`../src/paths.js?t=${Date.now()}-d`);
+    const reg = registry.load();
+    registry.addProfile(reg, 'work');
+    registry.save(reg);
+    registry.save(reg);
+
+    const leftovers = fs.readdirSync(paths.root()).filter((f) => f.endsWith('.tmp'));
+    assert.deepEqual(leftovers, []);
+    assert.deepEqual(
+      registry.load().profiles.map((p) => p.name),
+      ['work'],
+    );
   });
 });

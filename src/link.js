@@ -4,6 +4,42 @@ import path from 'node:path';
 const isWindows = process.platform === 'win32';
 
 /**
+ * Why a junction/symlink can be refused, and what to do instead. The no-link
+ * fallback matters most on managed work machines, where the home directory may
+ * live on a network share and endpoint protection may block reparse points.
+ */
+function linkHint() {
+  if (isWindows) {
+    return [
+      'Windows directory junctions only work on a local NTFS volume. They are refused when the',
+      'home directory sits on a network share or mapped drive, on a roaming/VDI profile, or on a',
+      'FAT32/exFAT disk — and some endpoint-protection rules block them outright.',
+      'codex-homes works without the link: run "codex-homes init --no-link" and pick the profile',
+      'per command with "codex-homes run <profile>" or the generated shims. Several Codex',
+      'sessions can then run side by side, each pinned to its own account.',
+    ];
+  }
+  return [
+    'The filesystem holding your home directory refused the symlink.',
+    'codex-homes works without it: run "codex-homes init --no-link" and pick the profile per',
+    'command with "codex-homes run <profile>" or the generated shims.',
+  ];
+}
+
+/** Wrap a raw symlink failure into something a user can act on. */
+function linkFailure(linkPath, targetPath, cause) {
+  const error = new Error(
+    [`could not create the link ${linkPath} -> ${targetPath}: ${cause.message}`, ...linkHint().map((l) => `  ${l}`)].join(
+      '\n',
+    ),
+  );
+  // init uses this flag to offer the no-link fallback instead of bailing out.
+  error.linkUnsupported = true;
+  error.cause = cause;
+  return error;
+}
+
+/**
  * Inspect a path without following links.
  * @returns {{exists: boolean, isLink: boolean, isDir: boolean, target: string|null}}
  */
@@ -12,7 +48,10 @@ export function inspect(target) {
   try {
     stats = fs.lstatSync(target);
   } catch (err) {
-    if (err.code === 'ENOENT') return { exists: false, isLink: false, isDir: false, target: null };
+    // ENOTDIR means a path component is not a directory, so the entry cannot exist.
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+      return { exists: false, isLink: false, isDir: false, target: null };
+    }
     throw err;
   }
 
@@ -66,12 +105,18 @@ export function setLink(linkPath, targetPath) {
   const state = inspect(linkPath);
   if (state.exists && !state.isLink) {
     throw new Error(
-      `${linkPath} is a real directory — run "codex-homes init" first so it can be migrated into a profile`,
+      `${linkPath} is a real directory, so it is not managed by codex-homes.\n` +
+        `  Run "codex-homes init" to migrate it into a profile, or use "codex-homes run <profile>"\n` +
+        `  and the generated shims to select a profile per command without a link.`,
     );
   }
   if (state.exists) removeLink(linkPath);
-  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
-  fs.symlinkSync(targetPath, linkPath, isWindows ? 'junction' : 'dir');
+  try {
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+    fs.symlinkSync(targetPath, linkPath, isWindows ? 'junction' : 'dir');
+  } catch (err) {
+    throw linkFailure(linkPath, targetPath, err);
+  }
 }
 
 /** True when `linkPath` is a link resolving to `targetPath`. */
@@ -118,6 +163,6 @@ export function migrateDirToProfile(sourceDir, profilePath) {
           `move it back to ${sourceDir} manually. Original error: ${err.message}`,
       );
     }
-    throw new Error(`could not create link at ${sourceDir}: ${err.message}`);
+    throw linkFailure(sourceDir, profilePath, err);
   }
 }

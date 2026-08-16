@@ -1,13 +1,57 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { profileDir, shimDir } from './paths.js';
+import { normalizeDirKey, profileDir, shimDir, splitPathEntries } from './paths.js';
+import { runPowerShell } from './win.js';
 
 const isWindows = process.platform === 'win32';
 
+/** Quote a value for `set "VAR=..."`. Only `%` survives the quotes in cmd. */
+function escapeCmdValue(value) {
+  return value.replace(/%/g, '%%');
+}
+
+/** Quote a value for /bin/sh so `$`, backticks and quotes stay literal. */
+function escapeShellValue(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** File name of a profile's launcher on the given platform. */
+export function shimFileName(name, platform = process.platform) {
+  return platform === 'win32' ? `${name}.cmd` : name;
+}
+
+/**
+ * The launcher body for one profile. Pure, so both platforms stay covered by
+ * the test suite no matter which one it runs on.
+ *
+ * The cmd variant uses `call`, because `codex` is itself a .cmd on Windows and
+ * batch files chain rather than return without it — `endlocal` would never run
+ * and the exit code would leak from whichever script happened to finish last.
+ */
+export function shimBody(homeDir, platform = process.platform) {
+  if (platform === 'win32') {
+    return [
+      '@echo off',
+      'setlocal',
+      `set "CODEX_HOME=${escapeCmdValue(homeDir)}"`,
+      'call codex %*',
+      'endlocal & exit /b %ERRORLEVEL%',
+      '',
+    ].join('\r\n');
+  }
+  return [
+    '#!/bin/sh',
+    `CODEX_HOME=${escapeShellValue(homeDir)}`,
+    'export CODEX_HOME',
+    'exec codex "$@"',
+    '',
+  ].join('\n');
+}
+
 /**
  * Write one launcher per profile so `codex-reserve <args>` runs Codex under that
- * profile without changing the active one.
+ * profile without changing the active one. Because each launcher pins
+ * CODEX_HOME for its own process only, several of them can run at the same time.
  * @returns {string[]} the shim files written
  */
 export function writeShims(names) {
@@ -16,35 +60,18 @@ export function writeShims(names) {
   const written = [];
 
   for (const name of names) {
-    const home = profileDir(name);
-    if (isWindows) {
-      const file = path.join(dir, `${name}.cmd`);
-      const body = [
-        '@echo off',
-        'setlocal',
-        `set "CODEX_HOME=${home}"`,
-        'codex %*',
-        'endlocal',
-        '',
-      ].join('\r\n');
-      fs.writeFileSync(file, body, 'utf8');
-      written.push(file);
-    } else {
-      const file = path.join(dir, name);
-      const body = ['#!/bin/sh', `CODEX_HOME="${home}"`, 'export CODEX_HOME', 'exec codex "$@"', ''].join('\n');
-      fs.writeFileSync(file, body, 'utf8');
-      fs.chmodSync(file, 0o755);
-      written.push(file);
-    }
+    const file = path.join(dir, shimFileName(name));
+    fs.writeFileSync(file, shimBody(profileDir(name)), 'utf8');
+    if (!isWindows) fs.chmodSync(file, 0o755);
+    written.push(file);
   }
   return written;
 }
 
 /** Remove a profile's launcher if it exists. */
 export function removeShim(name) {
-  const file = path.join(shimDir(), isWindows ? `${name}.cmd` : name);
   try {
-    fs.unlinkSync(file);
+    fs.unlinkSync(path.join(shimDir(), shimFileName(name)));
     return true;
   } catch {
     return false;
@@ -53,23 +80,52 @@ export function removeShim(name) {
 
 /** True when the shim directory is already on PATH for this process. */
 export function shimDirOnPath() {
-  const dir = path.resolve(shimDir());
-  return (process.env.PATH || '')
-    .split(path.delimiter)
-    .filter(Boolean)
-    .some((entry) => {
-      try {
-        return path.resolve(entry).toLowerCase() === dir.toLowerCase();
-      } catch {
-        return false;
-      }
-    });
+  const dir = normalizeDirKey(shimDir());
+  return splitPathEntries(process.env.PATH).some((entry) => {
+    try {
+      return normalizeDirKey(entry) === dir;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**
- * Append the shim directory to the persistent user PATH.
- * Uses PowerShell rather than `setx`, which silently truncates PATH at 1024 chars.
+ * PowerShell that appends `dir` to the persistent user PATH.
+ *
+ * Deliberately goes through the registry rather than
+ * [Environment]::SetEnvironmentVariable('Path', ...): that call reads the value
+ * already expanded and writes it back as a plain string, which silently turns
+ * an existing `%USERPROFILE%\bin` entry into a frozen absolute path.
  */
+export function buildUserPathScript(dir) {
+  const literal = `'${dir.replace(/'/g, "''")}'`;
+  return `
+$ErrorActionPreference = 'Stop'
+$dir = ${literal}
+$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+if ($null -eq $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }
+try {
+  $raw = ''
+  $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+  if ($key.GetValueNames() -contains 'Path') {
+    $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $kind = $key.GetValueKind('Path')
+  }
+  $parts = @($raw -split ';' | Where-Object { $_.Trim() -ne '' })
+  foreach ($part in $parts) {
+    if ($part.TrimEnd('\\') -ieq $dir.TrimEnd('\\')) { Write-Output 'already-present'; exit 0 }
+  }
+  $key.SetValue('Path', (($parts + $dir) -join ';'), $kind)
+} finally {
+  if ($key) { $key.Close() }
+}
+try { [Environment]::SetEnvironmentVariable('CODEX_HOMES_REFRESH', $null, 'User') } catch { }
+Write-Output 'added'
+`.trim();
+}
+
+/** Append the shim directory to the persistent user PATH. */
 export function addShimDirToUserPath() {
   const dir = shimDir();
   if (!isWindows) {
@@ -79,32 +135,17 @@ export function addShimDirToUserPath() {
     };
   }
 
-  const script = `
-$dir = $args[0]
-$current = [Environment]::GetEnvironmentVariable('Path','User')
-if ($null -eq $current) { $current = '' }
-$parts = $current -split ';' | Where-Object { $_ -ne '' }
-if ($parts -contains $dir) { Write-Output 'already-present'; exit 0 }
-$next = (($parts + $dir) -join ';')
-[Environment]::SetEnvironmentVariable('Path', $next, 'User')
-Write-Output 'added'
-`.trim();
-
   try {
-    const out = execFileSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script, dir],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
-    ).trim();
-    return {
-      applied: out === 'added',
-      alreadyPresent: out === 'already-present',
-      hint: 'open a new terminal for the PATH change to take effect',
-    };
+    const out = runPowerShell(buildUserPathScript(dir));
+    if (out === 'already-present') return { applied: false, alreadyPresent: true, hint: '' };
+    if (out === 'added') {
+      return { applied: true, hint: 'open a new terminal for the PATH change to take effect' };
+    }
+    return { applied: false, hint: `PowerShell returned "${out}" — add ${dir} to your PATH manually` };
   } catch (err) {
     return {
       applied: false,
-      hint: `could not update PATH automatically (${err.message.trim()}). Add manually: ${dir}`,
+      hint: `could not update PATH automatically (${err.message}). Add this directory manually: ${dir}`,
     };
   }
 }
